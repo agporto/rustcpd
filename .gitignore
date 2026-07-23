@@ -1,0 +1,23 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+*.so
+*.pyd
+*.pdb
+*.whl
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

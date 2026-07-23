@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["rustcpd", "python"]
+
+# Profiles apply workspace-wide and must live at the root.
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[profile.profiling]
+inherits = "release"
+debug = true

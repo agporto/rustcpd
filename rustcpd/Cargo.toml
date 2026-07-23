@@ -1,0 +1,41 @@
+[package]
+name = "rustcpd"
+version = "2.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BSD-2-Clause"
+description = "Rust implementation of Coherent Point Drift registration"
+readme = "README.md"
+documentation = "https://docs.rs/rustcpd"
+repository = "https://github.com/agporto/rustcpd"
+homepage = "https://github.com/agporto/rustcpd"
+authors = ["Arthur Porto <agporto@gmail.com>"]
+keywords = ["registration", "point-cloud", "cpd", "alignment", "geometry"]
+categories = ["science", "algorithms", "mathematics"]
+exclude = ["target/"]
+
+[features]
+default = []
+# Post-hoc shape completion and calibrated per-point uncertainty. Purely
+# additive: never runs inside `register()`, so the complete-data paths are
+# byte-for-byte unaffected whether or not it is enabled.
+completion = []
+
+[[example]]
+name = "completion"
+required-features = ["completion"]
+
+[dependencies]
+nalgebra = "0.34"
+kiddo = { version = "5.2.2", default-features = false }
+rayon = "1.11"
+thiserror = "2"
+faer = "0.24.4"
+
+[dev-dependencies]
+approx = "0.5"
+proptest = "1.11.0"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

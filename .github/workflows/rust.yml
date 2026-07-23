@@ -1,0 +1,89 @@
+name: Rust
+
+on:
+  push:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rustcpd/**"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "docs/**"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rustcpd/**"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "docs/**"
+      - ".github/workflows/rust.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rustcpd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features completion -- -D warnings
+      - run: cargo test --release
+      - run: cargo test --release --features completion
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: rustcpd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --all-features
+
+  msrv:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rustcpd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo check --all-targets
+      - run: cargo check --all-targets --all-features
+
+  docs:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rustcpd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  package:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rustcpd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package

@@ -1,0 +1,24 @@
+[package]
+name = "rustcpd-python"
+version = "2.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BSD-2-Clause"
+description = "Python bindings for the rustcpd registration library"
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustcpd = { path = "../rustcpd", features = ["completion"] }
+pyo3 = { version = "0.29", features = ["abi3-py39"] }
+numpy = "0.29"
+
+[features]
+default = []
+# Enabled by maturin at wheel-build time (see pyproject.toml); kept out of
+# `default` so plain `cargo check`/`clippy` link cleanly outside a Python
+# build environment.
+extension-module = ["pyo3/extension-module"]

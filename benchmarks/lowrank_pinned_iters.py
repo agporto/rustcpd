@@ -1,0 +1,74 @@
+"""Benchmark pivoted Cholesky vs full eigen low-rank deformable CPD,
+and f32 (single_precision) vs f64, at the user's working sizes.
+
+For each cloud size we generate a moving source `y` and a fixed target
+`x = y + G(y,y)@W` (a smooth, kernel-band-limited warp), then run
+register_deformable under four configs. Iterations are pinned equal so
+the eigen-vs-pivoted gap is the factorization setup cost, not a different
+convergence path.
+"""
+
+import time
+import numpy as np
+import rustcpd as cpd
+
+RNG = np.random.default_rng(0)
+BETA = 2.0
+ALPHA = 2.0
+LOW_RANK = 300
+MAX_ITERS = 30          # pinned so all configs do equal work per iter
+TOL = 1e-12             # effectively never triggers early stop
+SIZES = [1000, 2000, 3000, 5000]
+
+
+def make_pair(m, d=3):
+    # A spatially coherent cloud (not pure noise) so the Gaussian kernel
+    # is well-conditioned and the low-rank approximation is meaningful.
+    t = np.linspace(0, 1, m)
+    y = np.column_stack([
+        np.sin(2 * np.pi * t) * 1.7 + 0.15 * RNG.standard_normal(m),
+        np.cos(2 * np.pi * t) * 1.3 + 0.15 * RNG.standard_normal(m),
+        t * 2.0 + 0.15 * RNG.standard_normal(m),
+    ]).astype(np.float64)
+    g = cpd.gaussian_kernel(y, y, BETA)
+    w = 0.02 * RNG.standard_normal((m, d))
+    x = y + g @ w
+    return x, y
+
+
+def run(x, y, method, single):
+    t0 = time.perf_counter()
+    r = cpd.register_deformable(
+        x, y,
+        alpha=ALPHA, beta=BETA,
+        low_rank=LOW_RANK, low_rank_method=method,
+        max_iterations=MAX_ITERS, tolerance=TOL,
+        parallel=True, single_precision=single,
+    )
+    dt = time.perf_counter() - t0
+    return dt, r
+
+
+def rms(a, b):
+    return float(np.sqrt(np.mean((a - b) ** 2)))
+
+
+print(f"{'M':>6} {'method':>17} {'prec':>5} {'time(s)':>9} {'iters':>6} "
+      f"{'rms_vs_target':>14} {'rms_vs_eigen64':>15}")
+print("-" * 80)
+
+for m in SIZES:
+    x, y = make_pair(m)
+    # Baseline: full eigen, f64.
+    base_dt, base = run(x, y, "eigen", False)
+    configs = [
+        ("eigen", False, base_dt, base),
+        ("eigen", True, *run(x, y, "eigen", True)),
+        ("pivoted_cholesky", False, *run(x, y, "pivoted_cholesky", False)),
+        ("pivoted_cholesky", True, *run(x, y, "pivoted_cholesky", True)),
+    ]
+    for method, single, dt, r in configs:
+        prec = "f32" if single else "f64"
+        print(f"{m:>6} {method:>17} {prec:>5} {dt:>9.3f} {r.iterations:>6} "
+              f"{rms(r.points, x):>14.3e} {rms(r.points, base.points):>15.3e}")
+    print()

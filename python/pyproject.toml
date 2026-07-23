@@ -1,0 +1,39 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rustcpd"
+description = "Coherent Point Drift registration (rigid, affine, deformable, constrained, atlas/SSM) with a fast, deterministic Rust core"
+readme = "README.md"
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "Arthur Porto", email = "agporto@gmail.com" }]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+keywords = ["point-cloud", "registration", "cpd", "rustcpd", "alignment"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/agporto/rustcpd"
+Repository = "https://github.com/agporto/rustcpd"
+Documentation = "https://github.com/agporto/rustcpd#readme"
+Changelog = "https://github.com/agporto/rustcpd/blob/main/CHANGELOG.md"
+Issues = "https://github.com/agporto/rustcpd/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "rustcpd._core"
+features = ["extension-module"]

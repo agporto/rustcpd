@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use rustcpd in your research, please cite it."
+title: "rustcpd: Coherent Point Drift point-set registration in Rust"
+abstract: >-
+  A fast, deterministic Rust implementation of Coherent Point Drift
+  point-set registration (rigid, affine, deformable, constrained
+  deformable, and statistical-shape-model / atlas), with Python bindings
+  and calibrated shape-completion uncertainty.
+type: software
+authors:
+  - family-names: Porto
+    given-names: Arthur
+    email: agporto@gmail.com
+license: BSD-2-Clause
+repository-code: "https://github.com/agporto/rustcpd"
+url: "https://github.com/agporto/rustcpd"
+version: 2.1.0
+keywords:
+  - coherent point drift
+  - point-set registration
+  - non-rigid registration
+  - statistical shape model
+  - morphometrics
+  - Rust
+references:
+  - type: article
+    title: "Point Set Registration: Coherent Point Drift"
+    authors:
+      - family-names: Myronenko
+        given-names: Andriy
+      - family-names: Song
+        given-names: Xubo
+    journal: "IEEE Transactions on Pattern Analysis and Machine Intelligence"
+    volume: 32
+    issue: 12
+    year: 2010
+    doi: "10.1109/TPAMI.2010.46"
