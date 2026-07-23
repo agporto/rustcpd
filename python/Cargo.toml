@@ -2,7 +2,7 @@
 name = "rustcpd-python"
 version = "2.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "BSD-2-Clause"
 description = "Python bindings for the rustcpd registration library"
 publish = false

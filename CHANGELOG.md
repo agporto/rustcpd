@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Standardized every returned rotation on the direct row-vector convention
   `transformed = scale · points · rotation + translation`. Atlas, pose
   initialization, and completion previously exposed the transposed matrix.
+- Raised the declared Rust MSRV to 1.87 to match the current numerical
+  dependency stack.
+- Added explicit Python 3.12 wheel tests on Linux, macOS, and Windows while
+  retaining coverage for Python 3.9 and 3.13.
 
 ### Fixed
 

@@ -2,7 +2,7 @@
 name = "rustcpd"
 version = "2.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "BSD-2-Clause"
 description = "Rust implementation of Coherent Point Drift registration"
 readme = "README.md"

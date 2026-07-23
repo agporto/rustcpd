@@ -80,16 +80,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Oldest supported and a current CPython on every OS; the same
-        # abi3 wheel serves both, which is exactly what this verifies.
+        # Oldest supported, wheel-build baseline, and current CPython on
+        # every OS; the same abi3 wheel serves all three.
         # 3.9 on macOS runs on the Intel runner (arm64 runners provide
         # 3.10+ only); the universal2 wheel covers both architectures.
         include:
           - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.9" }
+          - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.12" }
           - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.13" }
           - { runner: macos-13, platform: macos-universal2, python: "3.9" }
+          - { runner: macos-latest, platform: macos-universal2, python: "3.12" }
           - { runner: macos-latest, platform: macos-universal2, python: "3.13" }
           - { runner: windows-latest, platform: windows-x64, python: "3.9" }
+          - { runner: windows-latest, platform: windows-x64, python: "3.12" }
           - { runner: windows-latest, platform: windows-x64, python: "3.13" }
     steps:
       - uses: actions/checkout@v4
