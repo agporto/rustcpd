@@ -1952,3 +1952,76 @@ fn atlas_reconstruct_validates_shapes() {
             .is_err()
     );
 }
+
+#[test]
+fn affine_parallel_and_serial_paths_match_bitwise() {
+    // The bitwise serial/parallel guarantee, pinned for the affine path
+    // (the dense rigid check does not exercise the affine M-step).
+    let y = cloud(80);
+    let b = DMatrix::from_row_slice(3, 3, &[1.02, 0.05, 0.0, -0.03, 0.99, 0.01, 0.0, 0.02, 1.01]);
+    let x = DMatrix::from_fn(80, 3, |i, j| {
+        (0..3).map(|q| y[(i, q)] * b[(q, j)]).sum::<f64>() + [0.04, -0.02, 0.01][j]
+    });
+    let run = |parallel| {
+        AffineRegistration::new(
+            &x,
+            &y,
+            AffineConfig {
+                em: EmConfig {
+                    tolerance: 0.0,
+                    max_iterations: 8,
+                    parallel,
+                    ..Default::default()
+                },
+                normalize: false,
+            },
+        )
+        .unwrap()
+        .register()
+        .unwrap()
+    };
+    let serial = run(false);
+    let parallel = run(true);
+    for (a, b) in serial.points.iter().zip(parallel.points.iter()) {
+        assert_eq!(a, b, "affine parallel/serial mismatch");
+    }
+    assert_eq!(serial.sigma2, parallel.sigma2);
+    assert_eq!(serial.objective, parallel.objective);
+}
+
+#[test]
+fn atlas_parallel_and_serial_paths_match_bitwise() {
+    // The bitwise serial/parallel guarantee, pinned for the atlas path.
+    let mean = cloud(80);
+    let modes = DMatrix::from_fn(mean.len(), 3, |i, k| {
+        ((i + 3 * k) as f64 * 0.05).sin() * 0.02
+    });
+    let x = DMatrix::from_fn(80, 3, |i, j| mean[(i, j)] + [0.04, -0.02, 0.01][j]);
+    let run = |parallel| {
+        AtlasRegistration::new(
+            &x,
+            &mean,
+            &modes,
+            AtlasConfig {
+                em: EmConfig {
+                    tolerance: 0.0,
+                    max_iterations: 8,
+                    parallel,
+                    ..Default::default()
+                },
+                eigenvalues: vec![1.0, 0.7, 0.4],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .register()
+        .unwrap()
+    };
+    let serial = run(false);
+    let parallel = run(true);
+    for (a, b) in serial.points.iter().zip(parallel.points.iter()) {
+        assert_eq!(a, b, "atlas parallel/serial mismatch");
+    }
+    assert_eq!(serial.sigma2, parallel.sigma2);
+    assert_eq!(serial.coefficients, parallel.coefficients);
+}

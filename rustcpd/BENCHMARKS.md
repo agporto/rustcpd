@@ -41,7 +41,7 @@ atlas from 129.80 ms to 40.66 ms. The audit made three math-preserving changes:
 ## Optimization audit (second pass, v1.4)
 
 Measured on a two-core AMD EPYC cloud sandbox (medians over the
-`benchmark` binary's repeats, 10 iterations per run; times in ms).
+`benchmark` example (`cargo run --release --example benchmark`)'s repeats, 10 iterations per run; times in ms).
 Speedups on machines with more cores should be larger for the dense and
 deformable paths, which parallelize across the Rayon pool.
 

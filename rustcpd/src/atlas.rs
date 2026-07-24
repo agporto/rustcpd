@@ -537,7 +537,7 @@ fn weighted_similarity(
     let mut correction: DMatrix<f64> = DMatrix::identity(d, d);
     correction[(d - 1, d - 1)] = (u.determinant() * vt.determinant()).signum();
     let a = &u * correction * &vt;
-    // C = Yᵀ P X, so the direct row-vector rotation is U·C·Vᵀ.
+    // C = Yᵀ P X, so the direct row-vector rotation is U·Vᵀ.
     let r = a.clone();
     let scale = if with_scale {
         let numerator = (a.transpose() * &c).trace();

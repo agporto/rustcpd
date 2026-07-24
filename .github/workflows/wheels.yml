@@ -88,7 +88,6 @@ jobs:
           - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.9" }
           - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.12" }
           - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.13" }
-          - { runner: macos-13, platform: macos-universal2, python: "3.9" }
           - { runner: macos-latest, platform: macos-universal2, python: "3.12" }
           - { runner: macos-latest, platform: macos-universal2, python: "3.13" }
           - { runner: windows-latest, platform: windows-x64, python: "3.9" }

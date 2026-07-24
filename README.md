@@ -254,9 +254,9 @@ Parameter-picking guidance lives in [`docs/TUNING.md`](docs/TUNING.md).
 
 ```toml
 [dependencies]
-rustcpd = "2.1"
+rustcpd = "3.0"
 # completion + uncertainty:
-# rustcpd = { version = "2.1", features = ["completion"] }
+# rustcpd = { version = "3.0", features = ["completion"] }
 ```
 
 ```rust
