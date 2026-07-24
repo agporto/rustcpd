@@ -3,8 +3,9 @@
 
 use proptest::prelude::*;
 use rustcpd::{
-    Constraint, DMatrix, DeformableConfig, DeformableRegistration, EmConfig, RigidConfig,
-    RigidRegistration, correspondences, gaussian_kernel, initialize_sigma2,
+    AffineConfig, AffineRegistration, Constraint, DMatrix, DeformableConfig,
+    DeformableRegistration, EmConfig, RigidConfig, RigidRegistration, correspondences,
+    gaussian_kernel, initialize_sigma2,
 };
 
 /// A cloud of `count` points in `dims` dimensions drawn from a bounded box,
@@ -191,6 +192,39 @@ proptest! {
                 .sum::<f64>()
                 .sqrt();
             prop_assert!(distance < 1e-3, "source {s} distance {distance}");
+        }
+    }
+
+    /// Affine parallel and serial execution are bitwise-identical for any
+    /// inputs (the rigid-only property missed the affine path entirely).
+    #[test]
+    fn affine_parallel_matches_serial_bitwise(
+        source in cloud_strategy(50, 3),
+        offset in prop::array::uniform3(-1.0f64..1.0),
+    ) {
+        let target = DMatrix::from_fn(source.nrows(), 3, |i, j| source[(i, j)] + offset[j]);
+        let run = |parallel| {
+            AffineRegistration::new(
+                &target,
+                &source,
+                AffineConfig {
+                    em: EmConfig {
+                        tolerance: 0.0,
+                        max_iterations: 12,
+                        parallel,
+                        ..Default::default()
+                    },
+                    normalize: false,
+                },
+            )
+            .unwrap()
+            .register()
+            .unwrap()
+        };
+        let serial = run(false);
+        let parallel = run(true);
+        for (a, b) in serial.points.iter().zip(parallel.points.iter()) {
+            prop_assert_eq!(a, b);
         }
     }
 }

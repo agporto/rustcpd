@@ -6,13 +6,16 @@ and the Python package share a version number.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.0.0] - 2026-07-24
 
 ### Changed
 
-- Standardized every returned rotation on the direct row-vector convention
+- **Breaking:** standardized every returned rotation on the direct
+  row-vector convention
   `transformed = scale · points · rotation + translation`. Atlas, pose
-  initialization, and completion previously exposed the transposed matrix.
+  initialization, and completion previously exposed the transposed matrix;
+  code that applied those rotations as `points @ rotation.T` must drop the
+  transpose. This is the reason for the major version bump.
 - Raised the declared Rust MSRV to 1.87 to match the current numerical
   dependency stack.
 - Added explicit Python 3.12 wheel tests on Linux, macOS, and Windows while
@@ -27,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gated the completion example behind the `completion` feature so default
   builds, Clippy, and tests compile.
 - Included the advertised PEP 561 `py.typed` marker in Python packages.
+- Moved the development benchmark harness from `src/bin/` to `examples/`
+  so `cargo install rustcpd` no longer installs a `benchmark` executable.
+
+### Added
+
+- CI parity gate: the cross-implementation parity example now runs in
+  serial and parallel on every push and the outputs must be byte-identical.
+- Bitwise serial-vs-parallel determinism tests for the affine and atlas
+  paths (previously rigid-only), plus an affine determinism property test.
+- The MSRV CI job now runs the full test suite rather than `cargo check`.
 
 ## [2.1.0]
 
@@ -287,5 +300,6 @@ faster. Numerical agreement with the original is ≤ 3e-12 relative across a
 parity suite covering every registration family. See
 [`rustcpd/BENCHMARKS.md`](rustcpd/BENCHMARKS.md).
 
-<!-- Add `[x.y.z]: <repo>/releases/tag/vx.y.z` reference links once the
-     repository URL is set (see the `repository` field in Cargo.toml). -->
+[3.0.0]: https://github.com/agporto/rustcpd/releases/tag/v3.0.0
+
+<!-- 2.1.0 and earlier predate the public repository and have no tags. -->

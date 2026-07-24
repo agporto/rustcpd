@@ -14,7 +14,7 @@ authors:
 license: BSD-2-Clause
 repository-code: "https://github.com/agporto/rustcpd"
 url: "https://github.com/agporto/rustcpd"
-version: 2.1.0
+version: 3.0.0
 keywords:
   - coherent point drift
   - point-set registration

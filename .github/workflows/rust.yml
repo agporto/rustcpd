@@ -63,8 +63,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.87.0
-      - run: cargo check --all-targets
-      - run: cargo check --all-targets --all-features
+      - run: cargo test --release
+      - run: cargo test --release --all-features
+
+  parity:
+    # Bitwise serial/parallel determinism gate over every registration
+    # family: the parity example must produce byte-identical output in
+    # both execution modes.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rustcpd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --example parity
+      - run: ../target/release/examples/parity > /tmp/parity_parallel.txt
+      - run: ../target/release/examples/parity serial > /tmp/parity_serial.txt
+      - run: cmp /tmp/parity_parallel.txt /tmp/parity_serial.txt
 
   docs:
     runs-on: ubuntu-latest
