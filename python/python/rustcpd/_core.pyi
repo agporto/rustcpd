@@ -216,6 +216,7 @@ def pose_initialize(
     lambda_regularization: float = ...,
     outlier_weight: float = ...,
     identity_prior_probability: float = ...,
+    with_scale: bool = ...,
     seed: int = ...,
     parallel: bool = ...,
     single_precision: bool = ...,
