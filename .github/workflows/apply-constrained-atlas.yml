@@ -30,6 +30,7 @@ jobs:
         shell: bash
         run: |
           cat .github/constrained-atlas-patch/part* | base64 --decode > /tmp/constrained-atlas.patch
+          test "$(wc -c < /tmp/constrained-atlas.patch)" -gt 25000
           git apply --check /tmp/constrained-atlas.patch
           git apply /tmp/constrained-atlas.patch
           cargo fmt --all
