@@ -53,6 +53,11 @@ statistical-shape-model/atlas, and pose-marginalized point-set registration.
 Every returned rotation uses the same row-vector convention:
 `transformed = scale · points · rotation + translation`.
 
+`PoseMarginalizedConfig::with_scale = false` fixes the residual pose scale at
+1.0 while continuing to optimize rotation and translation. This is intended
+for fragment workflows that pre-scale the source shape and modes from an
+external physical-size estimate before pose initialization.
+
 `EmConfig::k = None` selects the dense E-step. `Some(k)` selects a
 source-to-target k-nearest-neighbor approximation.
 
