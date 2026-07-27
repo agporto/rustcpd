@@ -60,7 +60,11 @@ guided = cpd.pose_initialize(
 fit = cpd.register_atlas(
     fragment, source, modes, eigenvalues, with_scale=False,
     initial_rotation=guided.rotation, initial_translation=guided.translation,
-    landmark_indices=kp_idx, landmark_targets=kp_xyz, landmark_weight=25.0,
+    # Prefer landmark_error (an explicit localization variance τ², here the
+    # keypoint noise ~ (0.02·radius)²) over the heuristic landmark_weight: it
+    # gives a fixed constraint strength and keeps fit.sigma2 a clean surface
+    # residual. fit.landmark_rms reports the landmark fit separately.
+    landmark_indices=kp_idx, landmark_targets=kp_xyz, landmark_error=(0.02 * radius) ** 2,
 )
 
 # The fit's residual variance is a strong failure signal: a wrong pose basin

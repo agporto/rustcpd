@@ -28,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logistic map on `log(sigma2)` from a few labelled fits so callers can flag
   low-confidence fragments for review or additional keypoints. `sigma2` is
   dataset-specific, so the map must be recalibrated per problem.
+- `AtlasConfig::landmark_error` (Python `register_atlas(landmark_error=...)`):
+  a principled alternative to `landmark_weight`. Each landmark is folded in with
+  mass `a = sigma2 / τ²` for an explicit localization variance `τ²` (squared
+  target-coordinate units), giving a *fixed* effective landmark variance
+  independent of annealing — the `DeformableConfig::constraint_error` scheme,
+  which the heuristic weight did not follow. Surface `sigma2` is then estimated
+  from the ordinary CPD correspondences only, so `AtlasResult.sigma2` stays a
+  clean surface-residual variance whose meaning does not shift with landmark
+  count/weight/noise (making the `PoseConfidenceCalibrator` transferable).
+  `AtlasResult.landmark_rms` reports the landmark fit separately. On a 200-trial
+  corner benchmark the principled mode matches or beats the heuristic weight
+  (99% [96,100] at τ = the true keypoint-noise level, vs 96% best for the
+  weight) and the surface `sigma2` is minimized at that physically-correct τ.
+  `landmark_weight` is retained as an explicitly heuristic alternative.
 - `PoseMarginalizedConfig::refine_landmark_weight` (Python
   `pose_initialize(refine_landmark_weight=...)`): anchors the keypoints during
   the refinement EM, not only in hypothesis scoring, so `pose_initialize`

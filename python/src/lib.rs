@@ -263,6 +263,10 @@ pub struct AtlasResult {
     /// Final convergence-criterion value.
     #[pyo3(get)]
     pub difference: f64,
+    /// RMS of the anchored-landmark residuals (original target frame); NaN when
+    /// no landmarks were supplied.
+    #[pyo3(get)]
+    pub landmark_rms: f64,
     // Retained in native form for reconstruct / apply_similarity.
     coefficients_vec: Vec<f64>,
     rotation_matrix: DMatrix<f64>,
@@ -451,6 +455,7 @@ impl AtlasResult {
             iterations: self.iterations,
             difference: self.difference,
             negative_log_likelihood: f64::INFINITY,
+            landmark_rms: f64::NAN,
         }
     }
 }
@@ -800,6 +805,7 @@ fn register_deformable(
     initial_coefficients = None, initial_rotation = None,
     initial_scale = 1.0, initial_translation = None, sigma2 = None,
     landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
+    landmark_error = None,
     max_iterations = 100, tolerance = 1e-3, outlier_weight = 0.0,
     k = None, parallel = true, single_precision = false))]
 #[allow(clippy::too_many_arguments)]
@@ -822,6 +828,7 @@ fn register_atlas(
     landmark_indices: Option<Vec<usize>>,
     landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
     landmark_weight: f64,
+    landmark_error: Option<f64>,
     max_iterations: usize,
     tolerance: f64,
     outlier_weight: f64,
@@ -875,6 +882,7 @@ fn register_atlas(
         initial_translation,
         landmarks,
         landmark_weight,
+        landmark_error,
     };
     let result = py
         .detach(|| cpd::AtlasRegistration::new(&x, &mean, &modes, config)?.register())
@@ -888,6 +896,7 @@ fn register_atlas(
         sigma2: result.sigma2,
         iterations: result.iterations,
         difference: result.difference,
+        landmark_rms: result.landmark_rms,
         coefficients_vec: result.coefficients,
         rotation_matrix: result.rotation,
         translation_vec: result.translation,

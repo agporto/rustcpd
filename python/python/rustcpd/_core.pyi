@@ -51,6 +51,7 @@ class AtlasResult:
     sigma2: float
     iterations: int
     difference: float
+    landmark_rms: float
     def reconstruct(
         self, mean: _ArrayLike, modes: _ArrayLike
     ) -> NDArray[np.float64]: ...
@@ -191,6 +192,7 @@ def register_atlas(
     landmark_indices: Sequence[int] | None = ...,
     landmark_targets: _ArrayLike | None = ...,
     landmark_weight: float = ...,
+    landmark_error: float | None = ...,
     max_iterations: int = ...,
     tolerance: float = ...,
     outlier_weight: float = ...,

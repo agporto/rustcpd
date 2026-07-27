@@ -705,3 +705,43 @@ def test_pose_initialize_anchored_refinement():
     assert np.allclose(np.asarray(a.rotation), np.asarray(b.rotation))
     with pytest.raises(ValueError):
         cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_weight=-1.0, **common)
+
+
+def test_register_atlas_landmark_error_mode():
+    y = cloud(40)
+    r = rotation_z(0.3)
+    # rigid target plus small non-model surface noise
+    target = (y @ r) + np.array([0.4, -0.2, 0.1]) + 0.01 * np.sin(np.arange(y.size).reshape(y.shape))
+    rank = 2
+    modes = _orthonormal_modes(len(y), rank)[:, :rank]
+    common = dict(optimize_similarity=True, with_scale=False, lambda_regularization=0.5,
+                  max_iterations=200, tolerance=1e-9)
+    base = cpd.register_atlas(target, y, modes, [1.0, 1.0], **common)
+    assert np.isnan(base.landmark_rms)  # no landmarks -> NaN
+    idx = [1, 12, 27]
+    tgt = np.asarray(base.points)[idx]  # consistent landmarks (already satisfied)
+    principled = cpd.register_atlas(target, y, modes, [1.0, 1.0],
+                                    landmark_indices=idx, landmark_targets=tgt,
+                                    landmark_error=1e-4, **common)
+    heavy = cpd.register_atlas(target, y, modes, [1.0, 1.0],
+                               landmark_indices=idx, landmark_targets=tgt,
+                               landmark_weight=200.0, **common)
+    assert principled.landmark_rms < 0.02
+    # principled surface sigma2 ~ unchanged; heuristic diluted by landmark mass
+    assert abs(principled.sigma2 - base.sigma2) < 0.1 * base.sigma2
+    assert heavy.sigma2 < 0.5 * base.sigma2
+    # tighter variance anchors harder (smaller landmark residual) on a divergent case
+    tgt2 = target[idx]
+    loose = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                               landmark_targets=tgt2, landmark_error=(0.2) ** 2, **common)
+    tight = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                               landmark_targets=tgt2, landmark_error=(0.02) ** 2, **common)
+    assert tight.landmark_rms < loose.landmark_rms
+
+
+def test_register_atlas_landmark_error_validation():
+    y = cloud(20)
+    modes = _orthonormal_modes(len(y), 2)[:, :2]
+    with pytest.raises(ValueError):
+        cpd.register_atlas(y, y, modes, [1.0, 1.0], landmark_indices=[0],
+                           landmark_targets=y[:1], landmark_error=-1.0)

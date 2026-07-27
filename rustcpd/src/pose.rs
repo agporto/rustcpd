@@ -353,6 +353,7 @@ impl PoseMarginalizedConfig {
                 initial_translation: Some(initial.translation.clone()),
                 landmarks: refine_landmarks.clone(),
                 landmark_weight: self.refine_landmark_weight,
+                landmark_error: None,
             };
             let result =
                 AtlasRegistration::new(&refined_target, &refined_source, &refined_modes, config)?
