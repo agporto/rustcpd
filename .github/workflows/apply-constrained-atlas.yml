@@ -1,0 +1,40 @@
+name: Apply constrained atlas implementation
+
+on:
+  push:
+    branches:
+      - feature/constrained-atlas-landmarks
+    paths:
+      - .github/workflows/apply-constrained-atlas.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/constrained-atlas-landmarks
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Reassemble and apply patch
+        shell: bash
+        run: |
+          cat .github/constrained-atlas-patch/part* | base64 --decode > /tmp/constrained-atlas.patch
+          git apply --check /tmp/constrained-atlas.patch
+          git apply /tmp/constrained-atlas.patch
+          cargo fmt --all
+      - name: Commit implementation
+        shell: bash
+        run: |
+          rm -rf .github/constrained-atlas-patch
+          rm -f .github/workflows/apply-constrained-atlas.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          git commit -m "Add landmark-constrained atlas registration"
+          git push origin HEAD:feature/constrained-atlas-landmarks
