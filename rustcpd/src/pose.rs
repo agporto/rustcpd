@@ -168,12 +168,8 @@ impl PoseMarginalizedConfig {
                 } else {
                     nonidentity_prior
                 };
-                let (scale, translation) = initial_similarity(
-                    &coarse_source,
-                    &coarse_target,
-                    rotation,
-                    self.with_scale,
-                );
+                let (scale, translation) =
+                    initial_similarity(&coarse_source, &coarse_target, rotation, self.with_scale);
                 let config = AtlasConfig {
                     em: EmConfig {
                         max_iterations: max_iters,
@@ -534,20 +530,10 @@ fn initial_similarity(
     with_scale: bool,
 ) -> (f64, Vec<f64>) {
     let source_centroid: Vec<_> = (0..3)
-        .map(|j| {
-            (0..source.nrows())
-                .map(|i| source[(i, j)])
-                .sum::<f64>()
-                / source.nrows() as f64
-        })
+        .map(|j| (0..source.nrows()).map(|i| source[(i, j)]).sum::<f64>() / source.nrows() as f64)
         .collect();
     let target_centroid: Vec<_> = (0..3)
-        .map(|j| {
-            (0..target.nrows())
-                .map(|i| target[(i, j)])
-                .sum::<f64>()
-                / target.nrows() as f64
-        })
+        .map(|j| (0..target.nrows()).map(|i| target[(i, j)]).sum::<f64>() / target.nrows() as f64)
         .collect();
     let scale = if with_scale {
         let source_radius = ((0..source.nrows())
@@ -656,8 +642,7 @@ fn score_candidate(
 #[cfg(test)]
 mod tests {
     use super::{
-        PoseMarginalizedConfig, axis_angle, initial_similarity, quaternion_matrix,
-        rotation_lattice,
+        PoseMarginalizedConfig, axis_angle, initial_similarity, quaternion_matrix, rotation_lattice,
     };
     use nalgebra::DMatrix;
 
@@ -681,29 +666,26 @@ mod tests {
             6,
             3,
             &[
-                -2.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
-                2.0, 0.0, 0.0, 0.0, 2.0, 0.0,
+                -2.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0,
+                2.0, 0.0,
             ],
         );
-        let fragment = DMatrix::from_row_slice(
-            3,
-            3,
-            &[3.0, -2.0, 0.5, 4.0, -2.0, 0.5, 3.0, -1.0, 0.5],
-        );
+        let fragment =
+            DMatrix::from_row_slice(3, 3, &[3.0, -2.0, 0.5, 4.0, -2.0, 0.5, 3.0, -1.0, 0.5]);
         let rotation = DMatrix::identity(3, 3);
         let (free_scale, _) = initial_similarity(&source, &fragment, &rotation, true);
-        let (fixed_scale, translation) =
-            initial_similarity(&source, &fragment, &rotation, false);
+        let (fixed_scale, translation) = initial_similarity(&source, &fragment, &rotation, false);
 
-        assert!(free_scale < 0.75, "free scale did not contract: {free_scale}");
+        assert!(
+            free_scale < 0.75,
+            "free scale did not contract: {free_scale}"
+        );
         assert_eq!(fixed_scale, 1.0);
 
         let source_centroid = [0.0, 1.0 / 3.0, 0.0];
         let fragment_centroid = [10.0 / 3.0, -5.0 / 3.0, 0.5];
         for j in 0..3 {
-            assert!(
-                (source_centroid[j] + translation[j] - fragment_centroid[j]).abs() < 1e-12
-            );
+            assert!((source_centroid[j] + translation[j] - fragment_centroid[j]).abs() < 1e-12);
         }
     }
 
@@ -713,8 +695,8 @@ mod tests {
             8,
             3,
             &[
-                -1.4, -0.2, 0.1, -0.7, 0.9, -0.3, 0.1, -1.1, 0.4, 0.8, 0.2, 0.7,
-                1.5, 1.0, -0.4, -1.0, 1.4, 0.8, 0.4, -0.6, -0.9, 1.1, -0.8, 0.2,
+                -1.4, -0.2, 0.1, -0.7, 0.9, -0.3, 0.1, -1.1, 0.4, 0.8, 0.2, 0.7, 1.5, 1.0, -0.4,
+                -1.0, 1.4, 0.8, 0.4, -0.6, -0.9, 1.1, -0.8, 0.2,
             ],
         );
         let rotation = axis_angle([0.0, 0.0, 1.0], 0.25);
