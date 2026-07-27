@@ -38,6 +38,13 @@ posed = result.scale * (mean @ result.rotation) + result.translation
 
 # Global pose search for atlas initialization (3-D).
 init = cpd.pose_initialize(source, target, modes, eigenvalues)
+
+# If source and modes were pre-scaled from a physical-size estimate (for
+# example, a target-completeness prior), keep residual scale fixed while
+# Pose-EM continues to optimize rotation and translation.
+fragment_init = cpd.pose_initialize(
+    prescaled_source, fragment, prescaled_modes, eigenvalues, with_scale=False,
+)
 ```
 
 After a **deformable** fit, apply the learned continuous warp to points it
