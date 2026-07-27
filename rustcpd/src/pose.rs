@@ -59,6 +59,12 @@ pub struct PoseMarginalizedConfig {
     pub outlier_weight: f64,
     /// Prior probability of the identity rotation, in `(0, 1)`.
     pub identity_prior_probability: f64,
+    /// Include a residual isotropic scale in each pose hypothesis.
+    ///
+    /// Set this to `false` when the source and modes have already been
+    /// pre-scaled from an external physical-size estimate. Rotation and
+    /// translation remain optimized.
+    pub with_scale: bool,
     /// Offset applied to the low-discrepancy rotation sequence.
     pub seed: u64,
     /// Evaluate hypotheses on the crate's Rayon pool.
@@ -86,6 +92,7 @@ impl Default for PoseMarginalizedConfig {
             lambda_regularization: 0.1,
             outlier_weight: 0.05,
             identity_prior_probability: 0.2,
+            with_scale: true,
             seed: 0,
             parallel: true,
             single_precision: false,
@@ -161,8 +168,12 @@ impl PoseMarginalizedConfig {
                 } else {
                     nonidentity_prior
                 };
-                let (scale, translation) =
-                    initial_similarity(&coarse_source, &coarse_target, rotation);
+                let (scale, translation) = initial_similarity(
+                    &coarse_source,
+                    &coarse_target,
+                    rotation,
+                    self.with_scale,
+                );
                 let config = AtlasConfig {
                     em: EmConfig {
                         max_iterations: max_iters,
@@ -176,7 +187,7 @@ impl PoseMarginalizedConfig {
                     lambda_regularization: self.lambda_regularization,
                     normalize: true,
                     optimize_similarity: true,
-                    with_scale: true,
+                    with_scale: self.with_scale,
                     initial_rotation: Some(rotation.clone()),
                     initial_scale: scale,
                     initial_translation: Some(translation),
@@ -283,7 +294,7 @@ impl PoseMarginalizedConfig {
                 lambda_regularization: self.lambda_regularization,
                 normalize: true,
                 optimize_similarity: true,
-                with_scale: true,
+                with_scale: self.with_scale,
                 kdtree_radius_scale: None,
                 initial_coefficients: Some(coefficients),
                 initial_rotation: Some(initial.rotation.clone()),
@@ -516,26 +527,59 @@ fn select_survivor_indices(screened: &[Candidate], count: usize) -> Vec<usize> {
     }
     survivors
 }
-fn initial_similarity(s: &DMatrix<f64>, t: &DMatrix<f64>, r: &DMatrix<f64>) -> (f64, Vec<f64>) {
-    let sm: Vec<_> = (0..3)
-        .map(|j| (0..s.nrows()).map(|i| s[(i, j)]).sum::<f64>() / s.nrows() as f64)
+fn initial_similarity(
+    source: &DMatrix<f64>,
+    target: &DMatrix<f64>,
+    rotation: &DMatrix<f64>,
+    with_scale: bool,
+) -> (f64, Vec<f64>) {
+    let source_centroid: Vec<_> = (0..3)
+        .map(|j| {
+            (0..source.nrows())
+                .map(|i| source[(i, j)])
+                .sum::<f64>()
+                / source.nrows() as f64
+        })
         .collect();
-    let tm: Vec<_> = (0..3)
-        .map(|j| (0..t.nrows()).map(|i| t[(i, j)]).sum::<f64>() / t.nrows() as f64)
+    let target_centroid: Vec<_> = (0..3)
+        .map(|j| {
+            (0..target.nrows())
+                .map(|i| target[(i, j)])
+                .sum::<f64>()
+                / target.nrows() as f64
+        })
         .collect();
-    let sr = ((0..s.nrows())
-        .map(|i| (0..3).map(|j| (s[(i, j)] - sm[j]).powi(2)).sum::<f64>())
-        .sum::<f64>()
-        / s.nrows() as f64)
-        .sqrt();
-    let tr = ((0..t.nrows())
-        .map(|i| (0..3).map(|j| (t[(i, j)] - tm[j]).powi(2)).sum::<f64>())
-        .sum::<f64>()
-        / t.nrows() as f64)
-        .sqrt();
-    let scale = tr / sr.max(f64::EPSILON);
+    let scale = if with_scale {
+        let source_radius = ((0..source.nrows())
+            .map(|i| {
+                (0..3)
+                    .map(|j| (source[(i, j)] - source_centroid[j]).powi(2))
+                    .sum::<f64>()
+            })
+            .sum::<f64>()
+            / source.nrows() as f64)
+            .sqrt();
+        let target_radius = ((0..target.nrows())
+            .map(|i| {
+                (0..3)
+                    .map(|j| (target[(i, j)] - target_centroid[j]).powi(2))
+                    .sum::<f64>()
+            })
+            .sum::<f64>()
+            / target.nrows() as f64)
+            .sqrt();
+        target_radius / source_radius.max(f64::EPSILON)
+    } else {
+        1.0
+    };
     let translation = (0..3)
-        .map(|j| tm[j] - scale * (0..3).map(|q| sm[q] * r[(q, j)]).sum::<f64>())
+        .map(|j| {
+            target_centroid[j]
+                - scale
+                    * (0..3)
+                        .map(|q| source_centroid[q] * rotation[(q, j)])
+                        .sum::<f64>()
+        })
         .collect();
     (scale, translation)
 }
@@ -611,7 +655,10 @@ fn score_candidate(
 
 #[cfg(test)]
 mod tests {
-    use super::{axis_angle, quaternion_matrix, rotation_lattice};
+    use super::{
+        PoseMarginalizedConfig, axis_angle, initial_similarity, quaternion_matrix,
+        rotation_lattice,
+    };
     use nalgebra::DMatrix;
 
     fn is_proper_rotation(r: &DMatrix<f64>) -> bool {
@@ -626,6 +673,88 @@ mod tests {
             })
         });
         orthonormal && (r.determinant() - 1.0).abs() < 1e-9
+    }
+
+    #[test]
+    fn fixed_scale_initialization_uses_centroid_translation_for_a_fragment() {
+        let source = DMatrix::from_row_slice(
+            6,
+            3,
+            &[
+                -2.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                2.0, 0.0, 0.0, 0.0, 2.0, 0.0,
+            ],
+        );
+        let fragment = DMatrix::from_row_slice(
+            3,
+            3,
+            &[3.0, -2.0, 0.5, 4.0, -2.0, 0.5, 3.0, -1.0, 0.5],
+        );
+        let rotation = DMatrix::identity(3, 3);
+        let (free_scale, _) = initial_similarity(&source, &fragment, &rotation, true);
+        let (fixed_scale, translation) =
+            initial_similarity(&source, &fragment, &rotation, false);
+
+        assert!(free_scale < 0.75, "free scale did not contract: {free_scale}");
+        assert_eq!(fixed_scale, 1.0);
+
+        let source_centroid = [0.0, 1.0 / 3.0, 0.0];
+        let fragment_centroid = [10.0 / 3.0, -5.0 / 3.0, 0.5];
+        for j in 0..3 {
+            assert!(
+                (source_centroid[j] + translation[j] - fragment_centroid[j]).abs() < 1e-12
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_scale_pose_still_optimizes_rotation_and_translation() {
+        let source = DMatrix::from_row_slice(
+            8,
+            3,
+            &[
+                -1.4, -0.2, 0.1, -0.7, 0.9, -0.3, 0.1, -1.1, 0.4, 0.8, 0.2, 0.7,
+                1.5, 1.0, -0.4, -1.0, 1.4, 0.8, 0.4, -0.6, -0.9, 1.1, -0.8, 0.2,
+            ],
+        );
+        let rotation = axis_angle([0.0, 0.0, 1.0], 0.25);
+        let offset = [0.7, -0.4, 0.2];
+        let target = DMatrix::from_fn(source.nrows(), 3, |i, j| {
+            (0..3)
+                .map(|q| source[(i, q)] * rotation[(q, j)])
+                .sum::<f64>()
+                + offset[j]
+        });
+        let modes = DMatrix::zeros(source.len(), 1);
+        let result = PoseMarginalizedConfig {
+            rotation_count: 1,
+            coarse_source_count: source.nrows(),
+            coarse_target_count: target.nrows(),
+            coarse_rank: 1,
+            coarse_iterations: 8,
+            coarse_screen_iterations: 8,
+            coarse_survivor_count: 1,
+            refine_count: 1,
+            refine_source_count: None,
+            refine_target_count: target.nrows(),
+            refine_iterations: 20,
+            with_scale: false,
+            parallel: false,
+            ..Default::default()
+        }
+        .initialize(&source, &target, &modes, &[1.0])
+        .unwrap();
+
+        assert_eq!(result.scale, 1.0);
+        let fitted = DMatrix::from_fn(source.nrows(), 3, |i, j| {
+            (0..3)
+                .map(|q| source[(i, q)] * result.rotation[(q, j)])
+                .sum::<f64>()
+                + result.translation[j]
+        });
+        let rms = (fitted - target).norm() / (source.len() as f64).sqrt();
+        assert!(rms < 1e-4, "fixed-scale pose RMS was {rms}");
+        assert!(result.translation.iter().any(|value| value.abs() > 0.1));
     }
 
     #[test]
