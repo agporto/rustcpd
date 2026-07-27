@@ -67,20 +67,32 @@ pub struct PoseMarginalizedConfig {
     /// the discrete decision local refinement alone cannot revisit. Empty
     /// (default) disables the term.
     pub landmarks: Vec<(usize, Vec<f64>)>,
-    /// Weight of the keypoint penalty, in units of effective target points
-    /// per landmark (the penalty is `0.5 · landmark_weight · ‖fitted −
-    /// target‖² / sigma2`, commensurate with the per-point CPD data cost).
-    /// `0` disables the term even when `landmarks` is non-empty.
+    /// Heuristic weight of the keypoint scoring penalty, in units of effective
+    /// target points per landmark (the penalty is `0.5 · landmark_weight ·
+    /// ‖fitted − target‖² / sigma2`). Because it divides by `sigma2`, the
+    /// effective landmark variance is `sigma2 / landmark_weight`, which drifts
+    /// with annealing. Prefer [`Self::landmark_error`]. `0` disables it.
     pub landmark_weight: f64,
-    /// Anchor the keypoints during the refinement EM as well (the
-    /// [`crate::AtlasConfig::landmark_weight`] gain, forwarded to each
-    /// survivor's refinement registration). With the default `0`, keypoints
-    /// only *score* hypotheses — they choose the basin but do not hold the
-    /// refined fit in place; a following anchored `register_atlas` polish is
-    /// then expected to supply that. Setting this makes `initialize` return a
-    /// keypoint-anchored result on its own. Landmark vertices are always
-    /// retained in the refinement source subsample when this is enabled.
+    /// Fixed keypoint localization variance `τ²` for the scoring penalty (the
+    /// principled alternative to [`Self::landmark_weight`]). When `Some`, each
+    /// hypothesis pays `0.5 · ‖fitted − target‖² / τ²` — a fixed landmark
+    /// precision independent of `sigma2`, matching the atlas
+    /// [`crate::AtlasConfig::landmark_error`]. Takes precedence over
+    /// `landmark_weight`. `None` (default) keeps the heuristic weight.
+    pub landmark_error: Option<f64>,
+    /// Anchor the keypoints during the refinement EM as well, using the atlas
+    /// heuristic [`crate::AtlasConfig::landmark_weight`] gain. With the default
+    /// `0`, keypoints only *score* hypotheses — they choose the basin but do
+    /// not hold the refined fit in place; a following anchored `register_atlas`
+    /// polish is then expected to supply that. Setting this makes `initialize`
+    /// return a keypoint-anchored result on its own. Landmark vertices are
+    /// always retained in the refinement source subsample when enabled.
     pub refine_landmark_weight: f64,
+    /// Fixed-variance alternative to [`Self::refine_landmark_weight`]: anchors
+    /// the refinement EM through the atlas [`crate::AtlasConfig::landmark_error`]
+    /// with localization variance `τ²`. Takes precedence over
+    /// `refine_landmark_weight`. `None` (default) uses the heuristic weight.
+    pub refine_landmark_error: Option<f64>,
     /// Include a residual isotropic scale in each pose hypothesis.
     ///
     /// Set this to `false` when the source and modes have already been
@@ -116,7 +128,9 @@ impl Default for PoseMarginalizedConfig {
             identity_prior_probability: 0.2,
             landmarks: Vec::new(),
             landmark_weight: 0.0,
+            landmark_error: None,
             refine_landmark_weight: 0.0,
+            refine_landmark_error: None,
             with_scale: true,
             seed: 0,
             parallel: true,
@@ -308,7 +322,9 @@ impl PoseMarginalizedConfig {
         // Anchored refinement needs every landmark vertex present in the
         // refinement subsample, with its landmark index remapped from the
         // full-source row to its subsample position.
-        let anchor_refine = self.refine_landmark_weight > 0.0 && !self.landmarks.is_empty();
+        let anchor_refine = (self.refine_landmark_weight > 0.0
+            || self.refine_landmark_error.is_some())
+            && !self.landmarks.is_empty();
         let refine_landmarks: Vec<(usize, Vec<f64>)> = if anchor_refine {
             self.landmarks
                 .iter()
@@ -353,7 +369,7 @@ impl PoseMarginalizedConfig {
                 initial_translation: Some(initial.translation.clone()),
                 landmarks: refine_landmarks.clone(),
                 landmark_weight: self.refine_landmark_weight,
-                landmark_error: None,
+                landmark_error: self.refine_landmark_error,
             };
             let result =
                 AtlasRegistration::new(&refined_target, &refined_source, &refined_modes, config)?
@@ -429,9 +445,11 @@ impl PoseMarginalizedConfig {
         })
     }
 
-    /// Keypoint-consistency penalty for one hypothesis, in the same "nats"
-    /// as the per-point CPD data cost (`0.5 · ‖·‖² / sigma2` per unit weight).
-    /// Zero when the term is disabled.
+    /// Keypoint-consistency penalty for one hypothesis, in the same "nats" as
+    /// the per-point CPD data cost. With [`Self::landmark_error`] `= τ²` it is
+    /// `0.5 · ‖·‖² / τ²` (fixed landmark precision); otherwise it falls back to
+    /// the heuristic `0.5 · landmark_weight · ‖·‖² / sigma2`. Zero when the term
+    /// is disabled.
     #[allow(clippy::too_many_arguments)]
     fn keypoint_penalty(
         &self,
@@ -443,7 +461,9 @@ impl PoseMarginalizedConfig {
         translation: &[f64],
         sigma2: f64,
     ) -> f64 {
-        if self.landmarks.is_empty() || self.landmark_weight <= 0.0 {
+        let active = !self.landmarks.is_empty()
+            && (self.landmark_error.is_some() || self.landmark_weight > 0.0);
+        if !active {
             return 0.0;
         }
         let residual = landmark_residual_sq(
@@ -455,7 +475,10 @@ impl PoseMarginalizedConfig {
             translation,
             &self.landmarks,
         );
-        0.5 * self.landmark_weight * residual / sigma2.max(f64::MIN_POSITIVE)
+        match self.landmark_error {
+            Some(t2) => 0.5 * residual / t2.max(f64::MIN_POSITIVE),
+            None => 0.5 * self.landmark_weight * residual / sigma2.max(f64::MIN_POSITIVE),
+        }
     }
 
     fn validate(
@@ -498,8 +521,20 @@ impl PoseMarginalizedConfig {
         if !self.landmark_weight.is_finite() || self.landmark_weight < 0.0 {
             return Err(Error::PositiveParameter("landmark_weight"));
         }
+        if self
+            .landmark_error
+            .is_some_and(|t2| !t2.is_finite() || t2 <= 0.0)
+        {
+            return Err(Error::PositiveParameter("landmark_error"));
+        }
         if !self.refine_landmark_weight.is_finite() || self.refine_landmark_weight < 0.0 {
             return Err(Error::PositiveParameter("refine_landmark_weight"));
+        }
+        if self
+            .refine_landmark_error
+            .is_some_and(|t2| !t2.is_finite() || t2 <= 0.0)
+        {
+            return Err(Error::PositiveParameter("refine_landmark_error"));
         }
         for (index, point) in &self.landmarks {
             if *index >= source.nrows()
@@ -1000,6 +1035,47 @@ mod landmark_pose_tests {
             }
         }
         assert!(worst < 0.05, "worst keypoint miss {worst}");
+    }
+
+    #[test]
+    fn landmark_error_scoring_and_refinement_recover() {
+        let (source, modes, ev) = model();
+        let r = axis_angle([0.2, -0.3, 0.9], 0.7);
+        let t = [0.4_f64, -0.25, 0.15];
+        let target = DMatrix::from_fn(30, 3, |i, j| {
+            (0..3).map(|q| source[(i, q)] * r[(q, j)]).sum::<f64>() + t[j]
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [0usize, 8, 17, 25]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+        // Fixed-variance scoring AND fixed-variance refinement, with a reduced
+        // refinement subsample to exercise the landmark remap path.
+        let mut cfg = config(landmarks.clone(), 0.0);
+        cfg.landmark_error = Some(1e-4);
+        cfg.refine_landmark_error = Some(1e-4);
+        cfg.refine_source_count = Some(12);
+        let init = cfg.initialize(&source, &target, &modes, &ev).unwrap();
+        assert!(is_proper(&init.rotation));
+        let mut worst = 0.0_f64;
+        for (i, q) in &landmarks {
+            for (j, qj) in q.iter().enumerate() {
+                let fitted = init.scale
+                    * (0..3)
+                        .map(|s| source[(*i, s)] * init.rotation[(s, j)])
+                        .sum::<f64>()
+                    + init.translation[j];
+                worst = worst.max((fitted - qj).abs());
+            }
+        }
+        assert!(worst < 0.05, "worst keypoint miss {worst}");
+        // A negative fixed variance (scoring or refinement) is rejected.
+        let mut bad = config(landmarks.clone(), 0.0);
+        bad.landmark_error = Some(-1.0);
+        assert!(bad.initialize(&source, &target, &modes, &ev).is_err());
+        let mut bad2 = config(landmarks, 0.0);
+        bad2.refine_landmark_error = Some(-1.0);
+        assert!(bad2.initialize(&source, &target, &modes, &ev).is_err());
     }
 
     #[test]

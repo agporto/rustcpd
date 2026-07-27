@@ -54,8 +54,13 @@ fragment_init = cpd.pose_initialize(
 # coordinates) + landmark_weight; off by default.
 guided = cpd.pose_initialize(
     source, fragment, modes, eigenvalues, with_scale=False,
-    landmark_indices=kp_idx, landmark_targets=kp_xyz, landmark_weight=15.0,
-    refine_landmark_weight=25.0,  # anchor keypoints in refinement too (recommended)
+    # Fixed keypoint variance τ² (here the localization noise ~ (0.02·radius)²)
+    # for both the basin scoring and the refinement anchoring — the principled
+    # form, matching register_atlas(landmark_error=...) below, so the whole
+    # pipeline uses one physical τ. (landmark_weight / refine_landmark_weight
+    # remain as heuristic fallbacks.)
+    landmark_indices=kp_idx, landmark_targets=kp_xyz,
+    landmark_error=(0.02 * radius) ** 2, refine_landmark_error=(0.02 * radius) ** 2,
 )
 fit = cpd.register_atlas(
     fragment, source, modes, eigenvalues, with_scale=False,

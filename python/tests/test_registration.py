@@ -745,3 +745,30 @@ def test_register_atlas_landmark_error_validation():
     with pytest.raises(ValueError):
         cpd.register_atlas(y, y, modes, [1.0, 1.0], landmark_indices=[0],
                            landmark_targets=y[:1], landmark_error=-1.0)
+
+
+def test_pose_initialize_landmark_error_scoring_and_refine():
+    y = cloud(30)
+    r = rotation_z(0.6)
+    target = (y @ r) + np.array([0.4, -0.2, 0.1])
+    modes = np.zeros((y.size, 1))
+    idx = [0, 9, 18, 27]
+    common = dict(
+        rotation_count=25, coarse_source_count=30, coarse_target_count=30,
+        coarse_rank=1, coarse_iterations=6, coarse_screen_iterations=6,
+        coarse_survivor_count=25, refine_count=4, refine_source_count=15,
+        refine_target_count=30, refine_iterations=20, with_scale=False,
+        landmark_indices=idx, landmark_targets=target[idx], parallel=False,
+    )
+    # fixed-variance scoring + fixed-variance refinement (fully principled pose)
+    init = cpd.pose_initialize(y, target, modes, [1.0], landmark_error=1e-4,
+                               refine_landmark_error=1e-4, **common)
+    fitted = init.scale * (y[idx] @ init.rotation) + init.translation
+    assert rms(fitted, target[idx]) < 0.05
+    # scoring-only fixed variance still returns a proper pose
+    scored = cpd.pose_initialize(y, target, modes, [1.0], landmark_error=1e-4, **common)
+    assert abs(np.linalg.det(np.asarray(scored.rotation)) - 1.0) < 1e-6
+    with pytest.raises(ValueError):
+        cpd.pose_initialize(y, target, modes, [1.0], landmark_error=-1.0, **common)
+    with pytest.raises(ValueError):
+        cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_error=-1.0, **common)

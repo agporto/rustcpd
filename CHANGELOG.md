@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logistic map on `log(sigma2)` from a few labelled fits so callers can flag
   low-confidence fragments for review or additional keypoints. `sigma2` is
   dataset-specific, so the map must be recalibrated per problem.
+- `PoseMarginalizedConfig::landmark_error` and `refine_landmark_error` (Python
+  `pose_initialize(landmark_error=..., refine_landmark_error=...)`): fixed
+  keypoint-localization-variance `τ²` forms of the pose scoring penalty and the
+  refinement anchoring, matching the atlas `landmark_error`. The scoring penalty
+  becomes `0.5 · ‖fitted − target‖² / τ²` (a fixed landmark precision,
+  independent of `sigma2`) and the refinement forwards `τ²` into the atlas
+  `landmark_error`. With these set, the whole pipeline — basin scoring →
+  refinement → atlas polish — uses one fixed-variance model with a single
+  physical `τ`. `landmark_weight` / `refine_landmark_weight` are retained as
+  heuristic fallbacks (default behavior unchanged).
 - `AtlasConfig::landmark_error` (Python `register_atlas(landmark_error=...)`):
   a principled alternative to `landmark_weight`. Each landmark is folded in with
   mass `a = sigma2 / τ²` for an explicit localization variance `τ²` (squared
