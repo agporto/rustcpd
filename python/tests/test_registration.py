@@ -333,6 +333,58 @@ def test_pose_initialize_recovers_similarity():
     assert init.hypotheses_refined == 3
 
 
+def test_pose_initialize_can_fix_residual_scale():
+    y = cloud(36)
+    r = rotation_z(0.25)
+    target = y @ r + np.array([0.7, -0.4, 0.2])
+    modes = np.zeros((y.size, 1))
+    init = cpd.pose_initialize(
+        y,
+        target,
+        modes,
+        [1.0],
+        rotation_count=1,
+        coarse_source_count=36,
+        coarse_target_count=36,
+        coarse_rank=1,
+        coarse_iterations=8,
+        refine_count=1,
+        refine_target_count=36,
+        refine_iterations=20,
+        with_scale=False,
+        parallel=False,
+    )
+    points = y @ init.rotation + init.translation
+    assert init.scale == 1.0
+    assert rms(points, target) < 1e-4
+    assert np.linalg.norm(init.translation) > 0.1
+
+
+def test_pose_compatibility_wrapper_forwards_fixed_scale():
+    y = cloud(24)
+    target = y + np.array([0.35, -0.2, 0.1])
+    modes = np.zeros((len(y), 3, 1))
+    init = cpd.pose_marginalized_initialization(
+        y,
+        target,
+        modes,
+        [1.0],
+        rotation_count=1,
+        coarse_source_count=len(y),
+        coarse_target_count=len(y),
+        coarse_rank=1,
+        coarse_iterations=4,
+        coarse_screen_iterations=4,
+        coarse_survivor_count=1,
+        refine_count=1,
+        refine_target_count=len(y),
+        refine_iterations=6,
+        with_scale=False,
+        n_jobs=1,
+    )
+    assert init.scale == 1.0
+
+
 def test_initialize_sigma2_matches_pairwise_definition():
     x, y = cloud(9), cloud(7)
     direct = np.mean(
