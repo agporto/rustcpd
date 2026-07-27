@@ -69,6 +69,7 @@ def pose_marginalized_initialization(
     lambda_reg=0.1,
     outlier_weight=0.05,
     identity_prior_probability=0.2,
+    with_scale=True,
     seed=0,
     n_jobs=1,
 ):
@@ -78,8 +79,10 @@ def pose_marginalized_initialization(
     callers written against it work unchanged. Translates the naming
     differences (``lambda_reg`` -> ``lambda_regularization``) and maps
     ``n_jobs`` onto the Rust core's deterministic parallel flag (``n_jobs == 1``
-    runs serially; any other value, including ``-1``, runs in parallel). Accepts
-    ``modes`` as ``(M, 3, K)`` or ``(3M, K)``.
+    runs serially; any other value, including ``-1``, runs in parallel). Set
+    ``with_scale=False`` for pre-scaled fragments to keep residual scale fixed
+    while rotation and translation remain optimized. Accepts ``modes`` as
+    ``(M, 3, K)`` or ``(3M, K)``.
     """
     import numpy as _np
 
@@ -106,6 +109,7 @@ def pose_marginalized_initialization(
         lambda_regularization=lambda_reg,
         outlier_weight=outlier_weight,
         identity_prior_probability=identity_prior_probability,
+        with_scale=with_scale,
         seed=seed,
         parallel=(n_jobs != 1),
     )
