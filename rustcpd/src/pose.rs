@@ -989,13 +989,13 @@ mod landmark_pose_tests {
         // Every anchored keypoint lands on its target under the recovered pose.
         let mut worst = 0.0_f64;
         for (i, q) in &landmarks {
-            for j in 0..3 {
+            for (j, qj) in q.iter().enumerate() {
                 let fitted = init.scale
                     * (0..3)
                         .map(|s| source[(*i, s)] * init.rotation[(s, j)])
                         .sum::<f64>()
                     + init.translation[j];
-                worst = worst.max((fitted - q[j]).abs());
+                worst = worst.max((fitted - qj).abs());
             }
         }
         assert!(worst < 0.05, "worst keypoint miss {worst}");
@@ -1043,13 +1043,13 @@ mod landmark_pose_tests {
         assert!(is_proper(&anchored.rotation));
         let mut worst = 0.0_f64;
         for (i, q) in &landmarks {
-            for j in 0..3 {
+            for (j, qj) in q.iter().enumerate() {
                 let fitted = anchored.scale
                     * (0..3)
                         .map(|s| source[(*i, s)] * anchored.rotation[(s, j)])
                         .sum::<f64>()
                     + anchored.translation[j];
-                worst = worst.max((fitted - q[j]).abs());
+                worst = worst.max((fitted - qj).abs());
             }
         }
         assert!(worst < 0.05, "anchored refinement keypoint miss {worst}");
