@@ -799,6 +799,7 @@ fn register_deformable(
     kdtree_radius_scale = None,
     initial_coefficients = None, initial_rotation = None,
     initial_scale = 1.0, initial_translation = None, sigma2 = None,
+    landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
     max_iterations = 100, tolerance = 1e-3, outlier_weight = 0.0,
     k = None, parallel = true, single_precision = false))]
 #[allow(clippy::too_many_arguments)]
@@ -818,6 +819,9 @@ fn register_atlas(
     initial_scale: f64,
     initial_translation: Option<Vec<f64>>,
     sigma2: Option<f64>,
+    landmark_indices: Option<Vec<usize>>,
+    landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
+    landmark_weight: f64,
     max_iterations: usize,
     tolerance: f64,
     outlier_weight: f64,
@@ -828,6 +832,27 @@ fn register_atlas(
     let x = matrix_from(target.as_array());
     let mean = matrix_from(mean.as_array());
     let modes = matrix_from(modes.as_array());
+    let landmarks: Vec<(usize, Vec<f64>)> = match (landmark_indices, landmark_targets.as_ref()) {
+        (Some(indices), Some(points)) => {
+            let pts = matrix_from(points.as_array());
+            if indices.len() != pts.nrows() {
+                return Err(PyValueError::new_err(
+                    "landmark_indices and landmark_targets must have matching lengths",
+                ));
+            }
+            indices
+                .into_iter()
+                .enumerate()
+                .map(|(row, index)| (index, (0..pts.ncols()).map(|j| pts[(row, j)]).collect()))
+                .collect()
+        }
+        (None, None) => Vec::new(),
+        _ => {
+            return Err(PyValueError::new_err(
+                "landmark_indices and landmark_targets must be provided together",
+            ));
+        }
+    };
     let config = cpd::AtlasConfig {
         em: em_config(
             sigma2,
@@ -848,6 +873,8 @@ fn register_atlas(
         initial_rotation: initial_rotation.as_ref().map(|r| matrix_from(r.as_array())),
         initial_scale,
         initial_translation,
+        landmarks,
+        landmark_weight,
     };
     let result = py
         .detach(|| cpd::AtlasRegistration::new(&x, &mean, &modes, config)?.register())
@@ -883,7 +910,9 @@ fn register_atlas(
     refine_count = 12, refine_source_count = None,
     refine_target_count = 1600, refine_iterations = 30,
     lambda_regularization = 0.1, outlier_weight = 0.05,
-    identity_prior_probability = 0.2, with_scale = true,
+    identity_prior_probability = 0.2,
+    landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
+    with_scale = true,
     seed = 0, parallel = true,
     single_precision = false))]
 #[allow(clippy::too_many_arguments)]
@@ -908,6 +937,9 @@ fn pose_initialize(
     lambda_regularization: f64,
     outlier_weight: f64,
     identity_prior_probability: f64,
+    landmark_indices: Option<Vec<usize>>,
+    landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
+    landmark_weight: f64,
     with_scale: bool,
     seed: u64,
     parallel: bool,
@@ -916,6 +948,27 @@ fn pose_initialize(
     let source = matrix_from(source.as_array());
     let target = matrix_from(target.as_array());
     let modes = matrix_from(modes.as_array());
+    let landmarks: Vec<(usize, Vec<f64>)> = match (landmark_indices, landmark_targets.as_ref()) {
+        (Some(indices), Some(points)) => {
+            let pts = matrix_from(points.as_array());
+            if indices.len() != pts.nrows() {
+                return Err(PyValueError::new_err(
+                    "landmark_indices and landmark_targets must have matching lengths",
+                ));
+            }
+            indices
+                .into_iter()
+                .enumerate()
+                .map(|(row, index)| (index, (0..pts.ncols()).map(|j| pts[(row, j)]).collect()))
+                .collect()
+        }
+        (None, None) => Vec::new(),
+        _ => {
+            return Err(PyValueError::new_err(
+                "landmark_indices and landmark_targets must be provided together",
+            ));
+        }
+    };
     let coarse_score_mode = match coarse_score_mode.as_str() {
         "trajectory" => cpd::PoseScoreMode::Trajectory,
         "final" => cpd::PoseScoreMode::Final,
@@ -941,6 +994,8 @@ fn pose_initialize(
         lambda_regularization,
         outlier_weight,
         identity_prior_probability,
+        landmarks,
+        landmark_weight,
         with_scale,
         seed,
         parallel,

@@ -6,6 +6,22 @@ and the Python package share a version number.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Optional anchored-keypoint (landmark) terms for fragment workflows whose
+  shape diverges from the model mean. `AtlasConfig::landmarks` /
+  `landmark_weight` keep a handful of corresponding vertices anchored as a soft
+  data term through every atlas EM iteration (folded into the E-step
+  sufficient statistics, so they steer both the shape-coefficient and
+  similarity M-steps). `PoseMarginalizedConfig::landmarks` / `landmark_weight`
+  add a keypoint-consistency penalty to every rotation hypothesis, steering the
+  global search toward the keypoint-consistent basin. Both are exposed through
+  the Python `register_atlas` and `pose_initialize` bindings as
+  `landmark_indices` / `landmark_targets` / `landmark_weight`, and are disabled
+  by default (empty `landmarks`, `landmark_weight = 0`).
+
 ## [3.0.0] - 2026-07-24
 
 ### Changed

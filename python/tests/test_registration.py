@@ -561,3 +561,88 @@ def test_atlas_reconstruct_validates():
         result.reconstruct(y, np.zeros((y.size, 3)))  # wrong rank
     with pytest.raises(ValueError):
         result.apply_similarity(np.zeros((5, 2)))  # wrong dim
+
+
+def test_register_atlas_landmarks_improve_underregularized_fit():
+    # Under heavy regularization the plain fit under-shoots the true shape;
+    # the landmark data term pulls the anchored vertices back onto target.
+    y = cloud(40)
+    rank = 2
+    modes = _orthonormal_modes(len(y), rank)[:, :rank]
+    truth = np.array([0.9, -0.7])
+    target = y + (modes @ truth).reshape(y.shape)
+    idx = [1, 12, 27, 33]
+    # A short, fixed EM budget under heavy regularization: the plain fit has
+    # not yet converged (the Mahalanobis prior still bites), while the landmark
+    # data term drives the anchored vertices onto their targets almost at once.
+    common = dict(
+        optimize_similarity=False, with_scale=False,
+        lambda_regularization=6.0, max_iterations=6, tolerance=0.0,
+    )
+    plain = cpd.register_atlas(target, y, modes, [1.0, 1.0], **common)
+    anchored = cpd.register_atlas(
+        target, y, modes, [1.0, 1.0],
+        landmark_indices=idx, landmark_targets=target[idx], landmark_weight=40.0,
+        **common,
+    )
+
+    def resid(res):
+        recon = np.asarray(res.reconstruct(y, modes))
+        return rms(recon[idx], target[idx])
+
+    assert resid(anchored) < 0.25 * resid(plain)
+
+
+def test_register_atlas_landmark_weight_zero_is_noop():
+    y = cloud(30)
+    target = y + 0.05
+    modes = _orthonormal_modes(len(y), 2)[:, :2]
+    common = dict(optimize_similarity=False, lambda_regularization=1.0, max_iterations=120)
+    base = cpd.register_atlas(target, y, modes, [1.0, 1.0], **common)
+    disabled = cpd.register_atlas(
+        target, y, modes, [1.0, 1.0],
+        landmark_indices=[0, 5], landmark_targets=np.zeros((2, 3)),
+        landmark_weight=0.0, **common,
+    )
+    assert np.allclose(base.coefficients, disabled.coefficients, atol=1e-12)
+
+
+def test_register_atlas_landmark_validation():
+    y = cloud(20)
+    modes = _orthonormal_modes(len(y), 2)[:, :2]
+    with pytest.raises(ValueError):  # targets missing
+        cpd.register_atlas(y, y, modes, [1.0, 1.0], landmark_indices=[0], landmark_weight=5.0)
+    with pytest.raises(ValueError):  # length mismatch
+        cpd.register_atlas(
+            y, y, modes, [1.0, 1.0],
+            landmark_indices=[0, 1], landmark_targets=y[:1], landmark_weight=5.0,
+        )
+
+
+def test_pose_initialize_landmarks_guide_basin():
+    y = cloud(30)
+    r = rotation_z(0.7)
+    target = (y @ r) + np.array([0.4, -0.25, 0.15])
+    modes = np.zeros((y.size, 1))
+    idx = [0, 8, 17, 25]
+    init = cpd.pose_initialize(
+        y, target, modes, [1.0],
+        rotation_count=25, coarse_source_count=30, coarse_target_count=30,
+        coarse_rank=1, coarse_iterations=6, coarse_screen_iterations=6,
+        coarse_survivor_count=25, refine_count=4, refine_target_count=30,
+        refine_iterations=20, with_scale=False,
+        landmark_indices=idx, landmark_targets=target[idx], landmark_weight=20.0,
+        parallel=False,
+    )
+    fitted = init.scale * (y[idx] @ init.rotation) + init.translation
+    assert rms(fitted, target[idx]) < 0.08
+
+
+def test_pose_initialize_landmark_validation():
+    y = cloud(20)
+    modes = np.zeros((y.size, 1))
+    with pytest.raises(ValueError):
+        cpd.pose_initialize(
+            y, y, modes, [1.0],
+            landmark_indices=[0, 1], landmark_targets=y[:1], landmark_weight=5.0,
+        )

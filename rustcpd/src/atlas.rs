@@ -39,6 +39,18 @@ pub struct AtlasConfig {
     pub initial_scale: f64,
     /// Starting translation (defaults to zero).
     pub initial_translation: Option<Vec<f64>>,
+    /// Anchored keypoint correspondences: each entry pairs a source-model
+    /// vertex index with its known target coordinate (in the original target
+    /// frame). Unlike [`Self::initial_rotation`] these persist through every
+    /// EM iteration as a soft data term, keeping the fit in the correct basin
+    /// while shape and pose are optimized. Empty (default) disables the term.
+    pub landmarks: Vec<(usize, Vec<f64>)>,
+    /// Gain on the landmark term, expressed as a multiple of the average
+    /// per-source posterior mass. Each landmark contributes
+    /// `landmark_weight · (Np / M)` of correspondence mass, so its influence
+    /// tracks the annealing level rather than being swamped as `sigma2`
+    /// shrinks. `0` disables the term even when `landmarks` is non-empty.
+    pub landmark_weight: f64,
 }
 
 impl Default for AtlasConfig {
@@ -55,6 +67,8 @@ impl Default for AtlasConfig {
             initial_rotation: None,
             initial_scale: 1.0,
             initial_translation: None,
+            landmarks: Vec::new(),
+            landmark_weight: 0.0,
         }
     }
 }
@@ -214,6 +228,17 @@ impl<'a> AtlasRegistration<'a> {
         if config.with_scale && (!config.initial_scale.is_finite() || config.initial_scale <= 0.0) {
             return Err(Error::PositiveParameter("initial_scale"));
         }
+        if !config.landmark_weight.is_finite() || config.landmark_weight < 0.0 {
+            return Err(Error::PositiveParameter("landmark_weight"));
+        }
+        for (index, point) in &config.landmarks {
+            if *index >= mean.nrows() {
+                return Err(Error::InvalidShape("landmarks"));
+            }
+            if point.len() != d || !point.iter().all(|value| value.is_finite()) {
+                return Err(Error::InvalidShape("landmarks"));
+            }
+        }
         if config
             .initial_rotation
             .as_ref()
@@ -303,6 +328,26 @@ impl<'a> AtlasRegistration<'a> {
             })
             .sum();
         let variance_floor = (1e-6 * extent2 / d as f64).max(variance_floor(&x, d));
+        // Landmark target coordinates mapped into the working frame. Empty
+        // unless the anchored-keypoint term is enabled.
+        let landmarks_work: Vec<(usize, Vec<f64>)> = if self.config.landmark_weight > 0.0 {
+            self.config
+                .landmarks
+                .iter()
+                .map(|(index, point)| {
+                    let mapped = if self.config.normalize {
+                        (0..d)
+                            .map(|j| (point[j] - centroid[j]) / target_scale)
+                            .collect()
+                    } else {
+                        point.clone()
+                    };
+                    (*index, mapped)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut diff = f64::INFINITY;
         let mut iterations = 0;
         let mut last_nll = f64::INFINITY;
@@ -338,11 +383,30 @@ impl<'a> AtlasRegistration<'a> {
             } else {
                 (&dense_em, None)
             };
-            let stats = posterior_stats(&x, &ty, sigma2, em, false, active_index);
+            let mut stats = posterior_stats(&x, &ty, sigma2, em, false, active_index);
             if stats.np <= f64::MIN_POSITIVE {
                 return Err(Error::SingularSystem);
             }
             last_nll = stats.negative_log_likelihood;
+            // Anchored-keypoint term: fold each landmark into the sufficient
+            // statistics as a high-mass virtual correspondence between source
+            // vertex `index` and its known target point `q`. It then flows
+            // into both M-steps — the coefficient solve (via the per-source
+            // target estimate `px/p1`) and the weighted-similarity solve —
+            // with no separate solver. The mass scales with `Np/M` so the
+            // anchors keep their grip as `sigma2` anneals down.
+            let mut landmark_xpx = 0.0;
+            if !landmarks_work.is_empty() {
+                let w = self.config.landmark_weight * stats.np / m as f64;
+                for (index, q) in &landmarks_work {
+                    for (j, value) in q.iter().enumerate() {
+                        stats.px[(*index, j)] += w * value;
+                    }
+                    stats.p1[*index] += w;
+                    stats.np += w;
+                    landmark_xpx += w * q.iter().map(|value| value * value).sum::<f64>();
+                }
+            }
             // residual = model-frame target estimate minus the mean shape,
             // written straight into the (M·D)×1 right-hand side buffer.
             for i in 0..m {
@@ -399,7 +463,8 @@ impl<'a> AtlasRegistration<'a> {
             let previous_sigma = sigma2;
             let xpx: f64 = (0..x.nrows())
                 .map(|i| stats.pt1[i] * (0..d).map(|j| x[(i, j)].powi(2)).sum::<f64>())
-                .sum();
+                .sum::<f64>()
+                + landmark_xpx;
             let ypy: f64 = (0..m)
                 .map(|i| stats.p1[i] * (0..d).map(|j| ty[(i, j)].powi(2)).sum::<f64>())
                 .sum();
@@ -562,4 +627,153 @@ fn weighted_similarity(
         .map(|j| mux[j] - scale * (0..d).map(|q| muy[q] * r[(q, j)]).sum::<f64>())
         .collect();
     Ok((r, scale, translation))
+}
+
+#[cfg(test)]
+mod landmark_tests {
+    use super::{AtlasConfig, AtlasRegistration};
+    use crate::EmConfig;
+    use nalgebra::DMatrix;
+
+    // Deterministic 8-point source and a rank-2 mode basis (point-major).
+    fn model() -> (DMatrix<f64>, DMatrix<f64>, Vec<f64>) {
+        let source = DMatrix::from_fn(8, 3, |i, j| {
+            let i = i as f64;
+            let j = j as f64;
+            (0.7 * i + 1.3 * j).sin() * 1.4 + 0.11 * i - 0.2 * j
+        });
+        let modes = DMatrix::from_fn(8 * 3, 2, |row, k| {
+            let row = row as f64;
+            let k = k as f64;
+            ((row + 1.0 + 5.0 * k) * 0.21).sin() * 0.5
+        });
+        (source, modes, vec![1.0, 1.0])
+    }
+
+    fn base_config() -> AtlasConfig {
+        AtlasConfig {
+            em: EmConfig {
+                // A short fixed budget: the Mahalanobis prior vanishes as
+                // sigma2 anneals to zero, so the regularization only bites
+                // before convergence. Six iterations keeps the plain fit
+                // under-shooting, giving the landmark term visible work to do.
+                max_iterations: 6,
+                tolerance: 0.0,
+                outlier_weight: 0.0,
+                ..Default::default()
+            },
+            eigenvalues: vec![1.0, 1.0],
+            // High regularization deliberately under-fits the shape, so the
+            // landmark data term has visible work to do.
+            lambda_regularization: 6.0,
+            normalize: false,
+            optimize_similarity: false,
+            with_scale: false,
+            ..Default::default()
+        }
+    }
+
+    fn landmark_residual(recon: &DMatrix<f64>, landmarks: &[(usize, Vec<f64>)]) -> f64 {
+        landmarks
+            .iter()
+            .map(|(i, q)| (0..3).map(|j| (recon[(*i, j)] - q[j]).powi(2)).sum::<f64>())
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    #[test]
+    fn landmarks_pull_anchored_vertices_toward_targets() {
+        let (source, modes, _) = model();
+        let truth = [0.9_f64, -0.7];
+        // Pure-shape target: source + modes·truth (identity pose).
+        let target = DMatrix::from_fn(8, 3, |i, j| {
+            source[(i, j)]
+                + (0..2)
+                    .map(|k| modes[(i * 3 + j, k)] * truth[k])
+                    .sum::<f64>()
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [1usize, 4, 6]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+
+        let plain = AtlasRegistration::new(&target, &source, &modes, base_config())
+            .unwrap()
+            .register()
+            .unwrap();
+        let anchored_cfg = AtlasConfig {
+            landmarks: landmarks.clone(),
+            landmark_weight: 40.0,
+            ..base_config()
+        };
+        let anchored = AtlasRegistration::new(&target, &source, &modes, anchored_cfg)
+            .unwrap()
+            .register()
+            .unwrap();
+
+        let plain_recon = plain.reconstruct(&source, &modes).unwrap();
+        let anchored_recon = anchored.reconstruct(&source, &modes).unwrap();
+        let plain_res = landmark_residual(&plain_recon, &landmarks);
+        let anchored_res = landmark_residual(&anchored_recon, &landmarks);
+
+        // The anchored fit places its landmark vertices much closer to their
+        // targets than the over-regularized plain fit, and does so by using
+        // more of the true coefficient (it stops under-fitting).
+        assert!(
+            anchored_res < 0.25 * plain_res,
+            "anchored {anchored_res} vs plain {plain_res}"
+        );
+        let plain_norm: f64 = plain.coefficients.iter().map(|c| c * c).sum();
+        let anchored_norm: f64 = anchored.coefficients.iter().map(|c| c * c).sum();
+        assert!(anchored_norm > plain_norm);
+    }
+
+    #[test]
+    fn zero_landmark_weight_is_a_noop() {
+        let (source, modes, _) = model();
+        let target = DMatrix::from_fn(8, 3, |i, j| source[(i, j)] + 0.05 * (i as f64 - j as f64));
+        let landmarks: Vec<(usize, Vec<f64>)> =
+            vec![(0, vec![0.0, 0.0, 0.0]), (5, vec![9.0, 9.0, 9.0])];
+        let without = AtlasRegistration::new(&target, &source, &modes, base_config())
+            .unwrap()
+            .register()
+            .unwrap();
+        // Landmarks present, but weight 0 must not perturb the result at all.
+        let disabled_cfg = AtlasConfig {
+            landmarks,
+            landmark_weight: 0.0,
+            ..base_config()
+        };
+        let disabled = AtlasRegistration::new(&target, &source, &modes, disabled_cfg)
+            .unwrap()
+            .register()
+            .unwrap();
+        for (a, b) in without.coefficients.iter().zip(&disabled.coefficients) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn atlas_rejects_invalid_landmarks() {
+        let (source, modes, _) = model();
+        let target = source.clone();
+        let bad_index = AtlasConfig {
+            landmarks: vec![(99, vec![0.0, 0.0, 0.0])],
+            landmark_weight: 1.0,
+            ..base_config()
+        };
+        assert!(AtlasRegistration::new(&target, &source, &modes, bad_index).is_err());
+        let bad_dim = AtlasConfig {
+            landmarks: vec![(0, vec![0.0, 0.0])],
+            landmark_weight: 1.0,
+            ..base_config()
+        };
+        assert!(AtlasRegistration::new(&target, &source, &modes, bad_dim).is_err());
+        let bad_weight = AtlasConfig {
+            landmarks: vec![(0, vec![0.0, 0.0, 0.0])],
+            landmark_weight: -1.0,
+            ..base_config()
+        };
+        assert!(AtlasRegistration::new(&target, &source, &modes, bad_weight).is_err());
+    }
 }

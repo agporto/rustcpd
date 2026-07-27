@@ -45,6 +45,22 @@ init = cpd.pose_initialize(source, target, modes, eigenvalues)
 fragment_init = cpd.pose_initialize(
     prescaled_source, fragment, prescaled_modes, eigenvalues, with_scale=False,
 )
+
+# A few corresponding keypoints (same locations on the model and the fragment)
+# steer the global pose search toward the keypoint-consistent basin, then keep
+# those vertices anchored while register_atlas optimizes shape + pose. Helpful
+# for fragments whose shape diverges from the mean. Both accept
+# landmark_indices (source-vertex indices) + landmark_targets (their observed
+# coordinates) + landmark_weight; off by default.
+guided = cpd.pose_initialize(
+    source, fragment, modes, eigenvalues, with_scale=False,
+    landmark_indices=kp_idx, landmark_targets=kp_xyz, landmark_weight=15.0,
+)
+fit = cpd.register_atlas(
+    fragment, source, modes, eigenvalues, with_scale=False,
+    initial_rotation=guided.rotation, initial_translation=guided.translation,
+    landmark_indices=kp_idx, landmark_targets=kp_xyz, landmark_weight=25.0,
+)
 ```
 
 After a **deformable** fit, apply the learned continuous warp to points it
