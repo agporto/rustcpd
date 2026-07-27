@@ -912,6 +912,7 @@ fn register_atlas(
     lambda_regularization = 0.1, outlier_weight = 0.05,
     identity_prior_probability = 0.2,
     landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
+    refine_landmark_weight = 0.0,
     with_scale = true,
     seed = 0, parallel = true,
     single_precision = false))]
@@ -940,6 +941,7 @@ fn pose_initialize(
     landmark_indices: Option<Vec<usize>>,
     landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
     landmark_weight: f64,
+    refine_landmark_weight: f64,
     with_scale: bool,
     seed: u64,
     parallel: bool,
@@ -996,6 +998,7 @@ fn pose_initialize(
         identity_prior_probability,
         landmarks,
         landmark_weight,
+        refine_landmark_weight,
         with_scale,
         seed,
         parallel,

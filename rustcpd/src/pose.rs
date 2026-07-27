@@ -72,6 +72,15 @@ pub struct PoseMarginalizedConfig {
     /// target‖² / sigma2`, commensurate with the per-point CPD data cost).
     /// `0` disables the term even when `landmarks` is non-empty.
     pub landmark_weight: f64,
+    /// Anchor the keypoints during the refinement EM as well (the
+    /// [`crate::AtlasConfig::landmark_weight`] gain, forwarded to each
+    /// survivor's refinement registration). With the default `0`, keypoints
+    /// only *score* hypotheses — they choose the basin but do not hold the
+    /// refined fit in place; a following anchored `register_atlas` polish is
+    /// then expected to supply that. Setting this makes `initialize` return a
+    /// keypoint-anchored result on its own. Landmark vertices are always
+    /// retained in the refinement source subsample when this is enabled.
+    pub refine_landmark_weight: f64,
     /// Include a residual isotropic scale in each pose hypothesis.
     ///
     /// Set this to `false` when the source and modes have already been
@@ -107,6 +116,7 @@ impl Default for PoseMarginalizedConfig {
             identity_prior_probability: 0.2,
             landmarks: Vec::new(),
             landmark_weight: 0.0,
+            refine_landmark_weight: 0.0,
             with_scale: true,
             seed: 0,
             parallel: true,
@@ -294,7 +304,28 @@ impl PoseMarginalizedConfig {
             }
         }
         let target_indices = subset_indices(target, Some(self.refine_target_count));
-        let source_indices = subset_indices(source, self.refine_source_count);
+        let mut source_indices = subset_indices(source, self.refine_source_count);
+        // Anchored refinement needs every landmark vertex present in the
+        // refinement subsample, with its landmark index remapped from the
+        // full-source row to its subsample position.
+        let anchor_refine = self.refine_landmark_weight > 0.0 && !self.landmarks.is_empty();
+        let refine_landmarks: Vec<(usize, Vec<f64>)> = if anchor_refine {
+            self.landmarks
+                .iter()
+                .map(|(index, point)| {
+                    let position = source_indices
+                        .iter()
+                        .position(|&s| s == *index)
+                        .unwrap_or_else(|| {
+                            source_indices.push(*index);
+                            source_indices.len() - 1
+                        });
+                    (position, point.clone())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let refined_target = select_rows(target, &target_indices);
         let refined_source = select_rows(source, &source_indices);
         let refined_modes = select_modes(modes, source.ncols(), &source_indices, eigenvalues.len());
@@ -320,7 +351,8 @@ impl PoseMarginalizedConfig {
                 initial_rotation: Some(initial.rotation.clone()),
                 initial_scale: initial.scale,
                 initial_translation: Some(initial.translation.clone()),
-                ..Default::default()
+                landmarks: refine_landmarks.clone(),
+                landmark_weight: self.refine_landmark_weight,
             };
             let result =
                 AtlasRegistration::new(&refined_target, &refined_source, &refined_modes, config)?
@@ -464,6 +496,9 @@ impl PoseMarginalizedConfig {
         }
         if !self.landmark_weight.is_finite() || self.landmark_weight < 0.0 {
             return Err(Error::PositiveParameter("landmark_weight"));
+        }
+        if !self.refine_landmark_weight.is_finite() || self.refine_landmark_weight < 0.0 {
+            return Err(Error::PositiveParameter("refine_landmark_weight"));
         }
         for (index, point) in &self.landmarks {
             if *index >= source.nrows()
@@ -984,6 +1019,55 @@ mod landmark_pose_tests {
         for (a, b) in plain.translation.iter().zip(&disabled.translation) {
             assert!((a - b).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn anchored_refinement_recovers_and_is_off_by_default() {
+        let (source, modes, ev) = model();
+        let r = axis_angle([0.1, 0.2, 0.97], 0.9);
+        let t = [0.3_f64, -0.2, 0.15];
+        let target = DMatrix::from_fn(30, 3, |i, j| {
+            (0..3).map(|q| source[(i, q)] * r[(q, j)]).sum::<f64>() + t[j]
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [2usize, 9, 14, 21, 27]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+        // Force the refinement subsample to drop points so the landmark index
+        // remap / extend path runs (refine_source_count < source rows, and
+        // some landmark vertices fall outside the farthest-point subsample).
+        let mut cfg = config(landmarks.clone(), 20.0);
+        cfg.refine_source_count = Some(12);
+        cfg.refine_landmark_weight = 25.0;
+        let anchored = cfg.initialize(&source, &target, &modes, &ev).unwrap();
+        assert!(is_proper(&anchored.rotation));
+        let mut worst = 0.0_f64;
+        for (i, q) in &landmarks {
+            for j in 0..3 {
+                let fitted = anchored.scale
+                    * (0..3)
+                        .map(|s| source[(*i, s)] * anchored.rotation[(s, j)])
+                        .sum::<f64>()
+                    + anchored.translation[j];
+                worst = worst.max((fitted - q[j]).abs());
+            }
+        }
+        assert!(worst < 0.05, "anchored refinement keypoint miss {worst}");
+
+        // refine_landmark_weight defaults to 0 and then has no effect.
+        let mut off = config(landmarks, 20.0);
+        off.refine_source_count = Some(12);
+        let base = off
+            .clone()
+            .initialize(&source, &target, &modes, &ev)
+            .unwrap();
+        assert_eq!(off.refine_landmark_weight, 0.0);
+        // A negative refine weight is rejected.
+        let mut bad = off.clone();
+        bad.refine_landmark_weight = -1.0;
+        assert!(bad.initialize(&source, &target, &modes, &ev).is_err());
+        // Sanity: the off run still returns a proper rotation.
+        assert!(is_proper(&base.rotation));
     }
 
     #[test]

@@ -680,3 +680,28 @@ def test_pose_confidence_calibrator_validates():
         cal.PoseConfidenceCalibrator.fit(np.array([1e-4, 0.0]), np.array([True, False]))
     with pytest.raises(ValueError):  # AUC needs both classes
         cal.failure_detection_auc(np.array([1e-4, 2e-4]), np.array([True, True]))
+
+
+def test_pose_initialize_anchored_refinement():
+    y = cloud(40)
+    r = rotation_z(0.6)
+    target = (y @ r) + np.array([0.3, -0.2, 0.1])
+    modes = np.zeros((y.size, 1))
+    idx = [0, 9, 18, 27, 36]
+    common = dict(
+        rotation_count=25, coarse_source_count=40, coarse_target_count=40,
+        coarse_rank=1, coarse_iterations=6, coarse_screen_iterations=6,
+        coarse_survivor_count=25, refine_count=4, refine_source_count=15,
+        refine_target_count=40, refine_iterations=20, with_scale=False,
+        landmark_indices=idx, landmark_targets=target[idx], landmark_weight=15.0,
+        parallel=False,
+    )
+    anchored = cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_weight=25.0, **common)
+    fitted = anchored.scale * (y[idx] @ anchored.rotation) + anchored.translation
+    assert rms(fitted, target[idx]) < 0.05
+    # default (0) is a no-op vs explicitly passing 0
+    a = cpd.pose_initialize(y, target, modes, [1.0], **common)
+    b = cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_weight=0.0, **common)
+    assert np.allclose(np.asarray(a.rotation), np.asarray(b.rotation))
+    with pytest.raises(ValueError):
+        cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_weight=-1.0, **common)

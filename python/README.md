@@ -55,6 +55,7 @@ fragment_init = cpd.pose_initialize(
 guided = cpd.pose_initialize(
     source, fragment, modes, eigenvalues, with_scale=False,
     landmark_indices=kp_idx, landmark_targets=kp_xyz, landmark_weight=15.0,
+    refine_landmark_weight=25.0,  # anchor keypoints in refinement too (recommended)
 )
 fit = cpd.register_atlas(
     fragment, source, modes, eigenvalues, with_scale=False,

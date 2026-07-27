@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logistic map on `log(sigma2)` from a few labelled fits so callers can flag
   low-confidence fragments for review or additional keypoints. `sigma2` is
   dataset-specific, so the map must be recalibrated per problem.
+- `PoseMarginalizedConfig::refine_landmark_weight` (Python
+  `pose_initialize(refine_landmark_weight=...)`): anchors the keypoints during
+  the refinement EM, not only in hypothesis scoring, so `pose_initialize`
+  returns a keypoint-anchored pose on its own rather than relying on a following
+  `register_atlas` polish. On the 200-trial benchmark this lifts standalone pose
+  success 57% → 79% and the full guided pipeline 84% → 90% (fixes 12 fragments,
+  breaks 0). Defaults to `0` (scoring-only, unchanged behavior).
 
 ## [3.0.0] - 2026-07-24
 

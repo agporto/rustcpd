@@ -222,6 +222,7 @@ def pose_initialize(
     landmark_indices: Sequence[int] | None = ...,
     landmark_targets: _ArrayLike | None = ...,
     landmark_weight: float = ...,
+    refine_landmark_weight: float = ...,
     with_scale: bool = ...,
     seed: int = ...,
     parallel: bool = ...,
