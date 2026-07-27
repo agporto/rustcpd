@@ -870,6 +870,10 @@ fn register_atlas(
 /// Pose-marginalized initialization: sweeps a rotation lattice and
 /// returns the best-scoring similarity transform and shape coefficients
 /// for starting a full atlas registration (3-D only).
+///
+/// Set `with_scale=False` when `source` and `modes` were already pre-scaled
+/// from an external physical-size estimate. Rotation and translation remain
+/// optimized, while the residual isotropic scale is fixed at 1.0.
 #[pyfunction]
 #[pyo3(signature = (source, target, modes, eigenvalues, *,
     rotation_count = 193, coarse_source_count = 400,
@@ -879,7 +883,8 @@ fn register_atlas(
     refine_count = 12, refine_source_count = None,
     refine_target_count = 1600, refine_iterations = 30,
     lambda_regularization = 0.1, outlier_weight = 0.05,
-    identity_prior_probability = 0.2, seed = 0, parallel = true,
+    identity_prior_probability = 0.2, with_scale = true,
+    seed = 0, parallel = true,
     single_precision = false))]
 #[allow(clippy::too_many_arguments)]
 fn pose_initialize(
@@ -903,6 +908,7 @@ fn pose_initialize(
     lambda_regularization: f64,
     outlier_weight: f64,
     identity_prior_probability: f64,
+    with_scale: bool,
     seed: u64,
     parallel: bool,
     single_precision: bool,
@@ -935,6 +941,7 @@ fn pose_initialize(
         lambda_regularization,
         outlier_weight,
         identity_prior_probability,
+        with_scale,
         seed,
         parallel,
         single_precision,
