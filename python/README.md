@@ -61,6 +61,14 @@ fit = cpd.register_atlas(
     initial_rotation=guided.rotation, initial_translation=guided.translation,
     landmark_indices=kp_idx, landmark_targets=kp_xyz, landmark_weight=25.0,
 )
+
+# The fit's residual variance is a strong failure signal: a wrong pose basin
+# cannot fit the fragment. Calibrate sigma2 -> P(correct) on a few labelled
+# fits (recalibrate per dataset), then flag low-confidence fragments.
+from rustcpd import calibration
+cal = calibration.PoseConfidenceCalibrator.fit(sigma2_array, correct_array)
+if not cal.trust(fit.sigma2):
+    ...  # low confidence: review or collect more keypoints
 ```
 
 After a **deformable** fit, apply the learned continuous warp to points it

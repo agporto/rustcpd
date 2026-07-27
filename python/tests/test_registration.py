@@ -646,3 +646,37 @@ def test_pose_initialize_landmark_validation():
             y, y, modes, [1.0],
             landmark_indices=[0, 1], landmark_targets=y[:1], landmark_weight=5.0,
         )
+
+
+def test_pose_confidence_calibrator_maps_sigma2_to_probability():
+    from rustcpd import calibration as cal
+    rng = np.random.default_rng(0)
+    # correct fits have small residual variance, failures large (well separated)
+    good = rng.uniform(1e-5, 1e-4, 60)
+    bad = rng.uniform(1e-2, 1e-1, 40)
+    sigma2 = np.concatenate([good, bad])
+    correct = np.concatenate([np.ones(60), np.zeros(40)]).astype(bool)
+
+    auc = cal.failure_detection_auc(sigma2, correct)
+    assert auc > 0.99  # sigma2 separates the two classes here
+
+    c = cal.PoseConfidenceCalibrator.fit(sigma2, correct)
+    assert c.slope < 0  # lower sigma2 -> higher confidence
+    assert c.probability(good.mean()) > 0.9
+    assert c.probability(bad.mean()) < 0.1
+    # monotone decreasing in sigma2
+    grid = np.array([1e-5, 1e-4, 1e-3, 1e-2, 1e-1])
+    p = c.probability(grid)
+    assert np.all(np.diff(p) < 0)
+    trust = c.trust(sigma2)
+    assert trust[:60].mean() > 0.95 and trust[60:].mean() < 0.05
+
+
+def test_pose_confidence_calibrator_validates():
+    from rustcpd import calibration as cal
+    with pytest.raises(ValueError):  # one class only
+        cal.PoseConfidenceCalibrator.fit(np.array([1e-4, 2e-4]), np.array([True, True]))
+    with pytest.raises(ValueError):  # non-positive sigma2
+        cal.PoseConfidenceCalibrator.fit(np.array([1e-4, 0.0]), np.array([True, False]))
+    with pytest.raises(ValueError):  # AUC needs both classes
+        cal.failure_detection_auc(np.array([1e-4, 2e-4]), np.array([True, True]))

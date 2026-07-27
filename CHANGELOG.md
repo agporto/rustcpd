@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Python `register_atlas` and `pose_initialize` bindings as
   `landmark_indices` / `landmark_targets` / `landmark_weight`, and are disabled
   by default (empty `landmarks`, `landmark_weight = 0`).
+- `calibration.PoseConfidenceCalibrator` and `calibration.failure_detection_auc`:
+  turn an atlas fit's residual `sigma2` into a calibrated `P(pose correct)`. A
+  wrong pose basin cannot fit the fragment and leaves a large residual, making
+  `sigma2` a strong unsupervised failure signal; the calibrator fits a 1-D
+  logistic map on `log(sigma2)` from a few labelled fits so callers can flag
+  low-confidence fragments for review or additional keypoints. `sigma2` is
+  dataset-specific, so the map must be recalibrated per problem.
 
 ## [3.0.0] - 2026-07-24
 
