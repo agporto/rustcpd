@@ -707,7 +707,7 @@ def test_pose_initialize_anchored_refinement():
         cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_weight=-1.0, **common)
 
 
-def test_register_atlas_landmark_error_mode():
+def test_register_atlas_landmark_sigma_mode():
     y = cloud(40)
     r = rotation_z(0.3)
     # rigid target plus small non-model surface noise
@@ -722,7 +722,7 @@ def test_register_atlas_landmark_error_mode():
     tgt = np.asarray(base.points)[idx]  # consistent landmarks (already satisfied)
     principled = cpd.register_atlas(target, y, modes, [1.0, 1.0],
                                     landmark_indices=idx, landmark_targets=tgt,
-                                    landmark_error=1e-4, **common)
+                                    landmark_sigma=1e-2, **common)
     heavy = cpd.register_atlas(target, y, modes, [1.0, 1.0],
                                landmark_indices=idx, landmark_targets=tgt,
                                landmark_weight=200.0, **common)
@@ -733,21 +733,21 @@ def test_register_atlas_landmark_error_mode():
     # tighter variance anchors harder (smaller landmark residual) on a divergent case
     tgt2 = target[idx]
     loose = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
-                               landmark_targets=tgt2, landmark_error=(0.2) ** 2, **common)
+                               landmark_targets=tgt2, landmark_sigma=0.2, **common)
     tight = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
-                               landmark_targets=tgt2, landmark_error=(0.02) ** 2, **common)
+                               landmark_targets=tgt2, landmark_sigma=0.02, **common)
     assert tight.landmark_rms < loose.landmark_rms
 
 
-def test_register_atlas_landmark_error_validation():
+def test_register_atlas_landmark_sigma_validation():
     y = cloud(20)
     modes = _orthonormal_modes(len(y), 2)[:, :2]
     with pytest.raises(ValueError):
         cpd.register_atlas(y, y, modes, [1.0, 1.0], landmark_indices=[0],
-                           landmark_targets=y[:1], landmark_error=-1.0)
+                           landmark_targets=y[:1], landmark_sigma=-1.0)
 
 
-def test_pose_initialize_landmark_error_scoring_and_refine():
+def test_pose_initialize_landmark_sigma_scoring_and_refine():
     y = cloud(30)
     r = rotation_z(0.6)
     target = (y @ r) + np.array([0.4, -0.2, 0.1])
@@ -761,14 +761,67 @@ def test_pose_initialize_landmark_error_scoring_and_refine():
         landmark_indices=idx, landmark_targets=target[idx], parallel=False,
     )
     # fixed-variance scoring + fixed-variance refinement (fully principled pose)
-    init = cpd.pose_initialize(y, target, modes, [1.0], landmark_error=1e-4,
-                               refine_landmark_error=1e-4, **common)
+    init = cpd.pose_initialize(y, target, modes, [1.0], landmark_sigma=1e-2,
+                               refine_landmark_sigma=1e-2, **common)
     fitted = init.scale * (y[idx] @ init.rotation) + init.translation
     assert rms(fitted, target[idx]) < 0.05
     # scoring-only fixed variance still returns a proper pose
-    scored = cpd.pose_initialize(y, target, modes, [1.0], landmark_error=1e-4, **common)
+    scored = cpd.pose_initialize(y, target, modes, [1.0], landmark_sigma=1e-2, **common)
     assert abs(np.linalg.det(np.asarray(scored.rotation)) - 1.0) < 1e-6
     with pytest.raises(ValueError):
-        cpd.pose_initialize(y, target, modes, [1.0], landmark_error=-1.0, **common)
+        cpd.pose_initialize(y, target, modes, [1.0], landmark_sigma=-1.0, **common)
     with pytest.raises(ValueError):
-        cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_error=-1.0, **common)
+        cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_sigma=-1.0, **common)
+
+
+def test_register_atlas_landmark_sigma_is_scale_equivariant():
+    # landmark_sigma is a standard deviation, so scaling the whole problem by c
+    # and the std by c must recover identical coefficients/rotation, with
+    # translation scaling by c. A unit-free weight would not do this.
+    y = cloud(40)
+    r = rotation_z(0.3)
+    rank = 2
+    modes = _orthonormal_modes(len(y), rank)[:, :rank]
+    truth = np.array([0.6, -0.4])
+    shape = y + (modes @ truth).reshape(y.shape)
+    target = shape @ r
+    idx = [1, 12, 27]
+    common = dict(optimize_similarity=True, with_scale=False,
+                  lambda_regularization=0.3, max_iterations=300, tolerance=1e-11,
+                  normalize=False)
+    unit = cpd.register_atlas(target, y, modes, [1.0, 1.0],
+                              landmark_indices=idx, landmark_targets=target[idx],
+                              landmark_sigma=0.05, **common)
+    c = 2.5
+    scaled = cpd.register_atlas(target * c, y * c, modes * c, [1.0, 1.0],
+                                landmark_indices=idx, landmark_targets=target[idx] * c,
+                                landmark_sigma=0.05 * c, **common)
+    assert np.allclose(unit.coefficients, scaled.coefficients, atol=1e-6)
+    assert np.allclose(np.asarray(unit.rotation), np.asarray(scaled.rotation), atol=1e-6)
+    assert np.allclose(np.asarray(unit.translation) * c, np.asarray(scaled.translation),
+                       atol=1e-6 * c)
+    assert abs(unit.landmark_rms * c - scaled.landmark_rms) < 1e-6 * c
+
+
+def test_register_atlas_landmark_sigma_takes_precedence_over_weight():
+    # Passing BOTH landmark_sigma and landmark_weight behaves like sigma alone:
+    # the fixed-variance term wins and the weight is ignored (no silent blend).
+    y = cloud(40)
+    rank = 2
+    modes = _orthonormal_modes(len(y), rank)[:, :rank]
+    truth = np.array([0.7, -0.5])
+    target = y + (modes @ truth).reshape(y.shape)
+    idx = [1, 12, 27]
+    tgt = target[idx] + 0.05  # inconsistent, so the two branches truly differ
+    common = dict(optimize_similarity=False, lambda_regularization=6.0,
+                  max_iterations=6, tolerance=0.0)
+    sigma_only = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                                    landmark_targets=tgt, landmark_sigma=0.02, **common)
+    both = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                              landmark_targets=tgt, landmark_sigma=0.02,
+                              landmark_weight=123.0, **common)
+    weight_only = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                                     landmark_targets=tgt, landmark_weight=123.0, **common)
+    assert np.allclose(sigma_only.coefficients, both.coefficients, atol=1e-12)
+    # and the fixed-variance branch is genuinely different from weight-only
+    assert not np.allclose(sigma_only.coefficients, weight_only.coefficients, atol=1e-6)

@@ -61,11 +61,14 @@ external physical-size estimate before pose initialization.
 A handful of corresponding keypoints — the same anatomical locations marked on
 the model and on the target — sharpen fragment fits that diverge in shape from
 the mean. Set `AtlasConfig::landmarks` (source-vertex index paired with its
-target coordinate) and a non-zero `AtlasConfig::landmark_weight` to keep those
-vertices anchored as a soft data term through every EM iteration, and set
-`PoseMarginalizedConfig::landmarks` / `landmark_weight` to let the same
+target coordinate) and a landmark strength to keep those vertices anchored as a
+soft data term through every EM iteration, and set
+`PoseMarginalizedConfig::landmarks` (plus a strength) to let the same
 correspondences steer the global rotation search toward the keypoint-consistent
-basin. Both terms are off by default (empty `landmarks`, `landmark_weight = 0`).
+basin. Prefer `landmark_sigma` (a physical keypoint-localization standard
+deviation `τ`, squared to a variance internally) over the heuristic
+`landmark_weight`; when both are set, `landmark_sigma` takes precedence. Both
+terms are off by default (empty `landmarks`, no strength).
 Three non-collinear keypoints are enough to resolve the rotation basin; the
 partial mesh does the rest.
 

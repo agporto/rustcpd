@@ -75,6 +75,11 @@ class PoseInitialization:
     rotation: NDArray[np.float64]
     scale: float
     translation: NDArray[np.float64]
+    # Unnormalized negative-log-posterior of the winner: ranks hypotheses only
+    # within a single run (includes the keypoint penalty when landmarks are set).
+    # Not comparable across runs, keypoint counts, or landmark_sigma values. Use
+    # the atlas sigma2 with calibration.PoseConfidenceCalibrator for cross-fit
+    # confidence.
     score: float
     score_margin: float
     posterior_entropy: float
@@ -192,7 +197,7 @@ def register_atlas(
     landmark_indices: Sequence[int] | None = ...,
     landmark_targets: _ArrayLike | None = ...,
     landmark_weight: float = ...,
-    landmark_error: float | None = ...,
+    landmark_sigma: float | None = ...,
     max_iterations: int = ...,
     tolerance: float = ...,
     outlier_weight: float = ...,
@@ -224,9 +229,9 @@ def pose_initialize(
     landmark_indices: Sequence[int] | None = ...,
     landmark_targets: _ArrayLike | None = ...,
     landmark_weight: float = ...,
-    landmark_error: float | None = ...,
+    landmark_sigma: float | None = ...,
     refine_landmark_weight: float = ...,
-    refine_landmark_error: float | None = ...,
+    refine_landmark_sigma: float | None = ...,
     with_scale: bool = ...,
     seed: int = ...,
     parallel: bool = ...,

@@ -476,9 +476,14 @@ pub struct PoseInitialization {
     #[pyo3(get)]
     pub translation: Py<PyArray1<f64>>,
     /// Negative-log-posterior score of the winner (lower is better).
+    /// Unnormalized: it only ranks hypotheses *within a single run* (and
+    /// includes the keypoint penalty when landmarks are set). Not comparable
+    /// across runs, across a different keypoint count, or a different
+    /// `landmark_sigma` / `landmark_weight`. For a cross-fit confidence signal
+    /// use the atlas `sigma2` with `calibration.PoseConfidenceCalibrator`.
     #[pyo3(get)]
     pub score: f64,
-    /// Score gap to the runner-up hypothesis.
+    /// Score gap to the runner-up hypothesis. Same within-run caveat as `score`.
     #[pyo3(get)]
     pub score_margin: f64,
     /// Shannon entropy of the refined-hypothesis posterior.
@@ -805,7 +810,7 @@ fn register_deformable(
     initial_coefficients = None, initial_rotation = None,
     initial_scale = 1.0, initial_translation = None, sigma2 = None,
     landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
-    landmark_error = None,
+    landmark_sigma = None,
     max_iterations = 100, tolerance = 1e-3, outlier_weight = 0.0,
     k = None, parallel = true, single_precision = false))]
 #[allow(clippy::too_many_arguments)]
@@ -828,7 +833,7 @@ fn register_atlas(
     landmark_indices: Option<Vec<usize>>,
     landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
     landmark_weight: f64,
-    landmark_error: Option<f64>,
+    landmark_sigma: Option<f64>,
     max_iterations: usize,
     tolerance: f64,
     outlier_weight: f64,
@@ -882,7 +887,7 @@ fn register_atlas(
         initial_translation,
         landmarks,
         landmark_weight,
-        landmark_error,
+        landmark_sigma,
     };
     let result = py
         .detach(|| cpd::AtlasRegistration::new(&x, &mean, &modes, config)?.register())
@@ -921,8 +926,8 @@ fn register_atlas(
     lambda_regularization = 0.1, outlier_weight = 0.05,
     identity_prior_probability = 0.2,
     landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
-    landmark_error = None,
-    refine_landmark_weight = 0.0, refine_landmark_error = None,
+    landmark_sigma = None,
+    refine_landmark_weight = 0.0, refine_landmark_sigma = None,
     with_scale = true,
     seed = 0, parallel = true,
     single_precision = false))]
@@ -951,9 +956,9 @@ fn pose_initialize(
     landmark_indices: Option<Vec<usize>>,
     landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
     landmark_weight: f64,
-    landmark_error: Option<f64>,
+    landmark_sigma: Option<f64>,
     refine_landmark_weight: f64,
-    refine_landmark_error: Option<f64>,
+    refine_landmark_sigma: Option<f64>,
     with_scale: bool,
     seed: u64,
     parallel: bool,
@@ -1010,9 +1015,9 @@ fn pose_initialize(
         identity_prior_probability,
         landmarks,
         landmark_weight,
-        landmark_error,
+        landmark_sigma,
         refine_landmark_weight,
-        refine_landmark_error,
+        refine_landmark_sigma,
         with_scale,
         seed,
         parallel,
