@@ -69,6 +69,12 @@ def pose_marginalized_initialization(
     lambda_reg=0.1,
     outlier_weight=0.05,
     identity_prior_probability=0.2,
+    landmark_indices=None,
+    landmark_targets=None,
+    landmark_weight=0.0,
+    landmark_sigma=None,
+    refine_landmark_weight=0.0,
+    refine_landmark_sigma=None,
     with_scale=True,
     seed=0,
     n_jobs=1,
@@ -83,6 +89,12 @@ def pose_marginalized_initialization(
     ``with_scale=False`` for pre-scaled fragments to keep residual scale fixed
     while rotation and translation remain optimized. Accepts ``modes`` as
     ``(M, 3, K)`` or ``(3M, K)``.
+
+    Anchored keypoints are forwarded too: pass ``landmark_indices`` /
+    ``landmark_targets`` and set the strength with ``landmark_sigma`` (a physical
+    localization std, preferred) or the heuristic ``landmark_weight``; the
+    ``refine_landmark_*`` pair anchors the refinement EM. All default off, so
+    existing callers are unaffected.
     """
     import numpy as _np
 
@@ -109,6 +121,12 @@ def pose_marginalized_initialization(
         lambda_regularization=lambda_reg,
         outlier_weight=outlier_weight,
         identity_prior_probability=identity_prior_probability,
+        landmark_indices=landmark_indices,
+        landmark_targets=landmark_targets,
+        landmark_weight=landmark_weight,
+        landmark_sigma=landmark_sigma,
+        refine_landmark_weight=refine_landmark_weight,
+        refine_landmark_sigma=refine_landmark_sigma,
         with_scale=with_scale,
         seed=seed,
         parallel=(n_jobs != 1),

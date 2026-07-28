@@ -638,6 +638,31 @@ def test_pose_initialize_landmarks_guide_basin():
     assert rms(fitted, target[idx]) < 0.08
 
 
+def test_pose_marginalized_wrapper_forwards_landmarks():
+    # The compatibility wrapper must forward keypoints to pose_initialize.
+    y = cloud(30)
+    r = rotation_z(0.7)
+    target = (y @ r) + np.array([0.4, -0.25, 0.15])
+    modes = np.zeros((y.size, 1))
+    idx = [0, 8, 17, 25]
+    common = dict(
+        rotation_count=25, coarse_source_count=30, coarse_target_count=30,
+        coarse_rank=1, coarse_iterations=6, coarse_screen_iterations=6,
+        coarse_survivor_count=25, refine_count=4, refine_target_count=30,
+        refine_iterations=20, with_scale=False, n_jobs=1,
+    )
+    guided = cpd.pose_marginalized_initialization(
+        y, target, modes, [1.0],
+        landmark_indices=idx, landmark_targets=target[idx],
+        landmark_sigma=0.02, refine_landmark_sigma=0.02, **common,
+    )
+    fitted = guided.scale * (y[idx] @ guided.rotation) + guided.translation
+    assert rms(fitted, target[idx]) < 0.08
+    # blind wrapper (no landmarks) is unaffected and still returns a proper pose
+    blind = cpd.pose_marginalized_initialization(y, target, modes, [1.0], **common)
+    assert abs(np.linalg.det(np.asarray(blind.rotation)) - 1.0) < 1e-6
+
+
 def test_pose_initialize_landmark_validation():
     y = cloud(20)
     modes = np.zeros((y.size, 1))

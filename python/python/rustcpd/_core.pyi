@@ -51,6 +51,9 @@ class AtlasResult:
     sigma2: float
     iterations: int
     difference: float
+    # Pointwise RMS of landmark residuals sqrt(sum||r||^2/K); NaN with no
+    # landmarks. Noise floor is sqrt(D)*tau (sqrt(3)*tau in 3D); normalized
+    # discrepancy (landmark_rms/(sqrt(D)*tau))**2 is ~1 at the noise floor.
     landmark_rms: float
     def reconstruct(
         self, mean: _ArrayLike, modes: _ArrayLike

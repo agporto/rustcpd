@@ -452,8 +452,9 @@ impl PoseMarginalizedConfig {
     }
 
     /// Keypoint-consistency penalty for one hypothesis, in the same "nats" as
-    /// the per-point CPD data cost. With [`Self::landmark_sigma`] `= τ²` it is
-    /// `0.5 · ‖·‖² / τ²` (fixed landmark precision); otherwise it falls back to
+    /// the per-point CPD data cost. With [`Self::landmark_sigma`] `= τ` (a std,
+    /// squared internally) it is `0.5 · ‖·‖² / τ²` (fixed landmark precision,
+    /// independent of `sigma2`); otherwise it falls back to
     /// the heuristic `0.5 · landmark_weight · ‖·‖² / sigma2`. Zero when the term
     /// is disabled.
     #[allow(clippy::too_many_arguments)]

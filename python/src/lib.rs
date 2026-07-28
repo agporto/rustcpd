@@ -263,8 +263,12 @@ pub struct AtlasResult {
     /// Final convergence-criterion value.
     #[pyo3(get)]
     pub difference: f64,
-    /// RMS of the anchored-landmark residuals (original target frame); NaN when
-    /// no landmarks were supplied.
+    /// Pointwise RMS of the anchored-landmark residuals `sqrt(sum||r_l||^2 / K)`
+    /// (original target frame); NaN when no landmarks were supplied. Under
+    /// isotropic per-coordinate noise `tau` its noise floor is `sqrt(D)*tau`
+    /// (`sqrt(3)*tau` in 3D), not `tau`; for a scale-free check form the reduced
+    /// chi-square `(landmark_rms / (sqrt(D)*tau))**2`, which is ~1 at the noise
+    /// floor.
     #[pyo3(get)]
     pub landmark_rms: f64,
     // Retained in native form for reconstruct / apply_similarity.

@@ -65,8 +65,13 @@ pub struct AtlasConfig {
     /// giving a *fixed* effective landmark variance independent of annealing —
     /// exactly the `DeformableConfig::constraint_error` scheme. Surface `sigma2`
     /// is then estimated from the ordinary CPD correspondences only, so
-    /// [`AtlasResult::sigma2`] stays a clean surface-residual variance and the
-    /// shape prior is not incidentally relaxed by the anchors. Choose `τ` to
+    /// [`AtlasResult::sigma2`] stays a clean surface-residual variance. Landmark
+    /// mass no longer *directly* contaminates the surface variance or, through
+    /// it, weakens the prior; the prior can still adapt *indirectly* when the
+    /// constrained solution genuinely lowers the surface residual (the prior
+    /// coefficient is `γ = λ·sigma2/scale²`, so a smaller `sigma2` does relax
+    /// it — that is the intended adaptive annealing, not the contamination this
+    /// mode removes). Choose `τ` to
     /// reflect not only annotation noise but also the model-truncation /
     /// landmark-representation error, or the anchors may overconstrain what the
     /// truncated SSM cannot reproduce. Takes precedence over `landmark_weight`
@@ -118,9 +123,18 @@ pub struct AtlasResult {
     /// "trajectory" data objective). `f64::INFINITY` if no EM step ran.
     pub negative_log_likelihood: f64,
     /// RMS of the anchored-landmark residuals `‖similarity(mean+modes·b)ᵢ − qᵢ‖`
-    /// at the final iteration, in the original target frame. `f64::NAN` when no
-    /// landmarks were supplied. Reported separately from [`Self::sigma2`] so the
-    /// surface-fit variance and the landmark fit can be read independently.
+    /// at the final iteration, in the original target frame — a *pointwise* RMS,
+    /// `sqrt(Σₗ‖rₗ‖² / K)`. `f64::NAN` when no landmarks were supplied. Reported
+    /// separately from [`Self::sigma2`] so the surface-fit variance and the
+    /// landmark fit can be read independently.
+    ///
+    /// Because each residual is a `D`-vector, under isotropic per-coordinate
+    /// localization noise `τ` its expected noise-floor magnitude is `√D · τ`
+    /// (`√3 · τ` in 3D), not `τ`. For a scale-free "is the landmark fit within
+    /// noise?" check, form the normalized discrepancy
+    /// `(landmark_rms / (√D · τ))²` (equivalently the reduced
+    /// `χ² = Σₗ‖rₗ‖² / (D·K·τ²)`), which is ≈ 1 when the residuals are just
+    /// localization noise and ≫ 1 when the anchors are fighting the fit.
     pub landmark_rms: f64,
 }
 
@@ -394,6 +408,20 @@ impl<'a> AtlasRegistration<'a> {
             Vec::new()
         };
         let mut landmark_rms = f64::NAN;
+        // Landmark rows are constant across EM iterations. Precompute a mask and
+        // the unique row list once so the principled variance update can read the
+        // surface (pre-augmentation) p1/px at those rows directly — avoiding the
+        // catastrophic cancellation that subtracting a huge augmented landmark
+        // term back out would incur for a tight `τ` (large mass) or large-scale
+        // coordinates.
+        let is_landmark_row = {
+            let mut mask = vec![false; m];
+            for (index, _) in &landmarks_work {
+                mask[*index] = true;
+            }
+            mask
+        };
+        let unique_landmark_rows: Vec<usize> = (0..m).filter(|&i| is_landmark_row[i]).collect();
         let mut diff = f64::INFINITY;
         let mut iterations = 0;
         let mut last_nll = f64::INFINITY;
@@ -458,6 +486,14 @@ impl<'a> AtlasRegistration<'a> {
                     None => self.config.landmark_weight * np_surface / m as f64,
                 }
             };
+            // Surface (pre-augmentation) p1/px at the unique landmark rows,
+            // captured BEFORE the augmentation below so the principled variance
+            // update can use them directly instead of subtracting the huge
+            // augmented landmark term back out.
+            let landmark_surface: Vec<(f64, Vec<f64>)> = unique_landmark_rows
+                .iter()
+                .map(|&i| (stats.p1[i], (0..d).map(|j| stats.px[(i, j)]).collect()))
+                .collect();
             for (index, q) in &landmarks_work {
                 for (j, value) in q.iter().enumerate() {
                     stats.px[(*index, j)] += landmark_mass * value;
@@ -519,41 +555,56 @@ impl<'a> AtlasRegistration<'a> {
                 / rank as f64;
             previous_coefficients.copy_from_slice(&coefficients);
             let previous_sigma = sigma2;
+            // `xpx` uses the target-side posterior mass `pt1`, which the landmark
+            // augmentation never touches, so it is already surface-clean.
             let xpx_surface: f64 = (0..x.nrows())
                 .map(|i| stats.pt1[i] * (0..d).map(|j| x[(i, j)].powi(2)).sum::<f64>())
                 .sum();
-            let ypy_aug: f64 = (0..m)
-                .map(|i| stats.p1[i] * (0..d).map(|j| ty[(i, j)].powi(2)).sum::<f64>())
+            // Raw landmark residual for reporting (no cancellation involved).
+            let lm_resid2: f64 = landmarks_work
+                .iter()
+                .map(|(index, q)| {
+                    (0..d)
+                        .map(|j| (ty[(*index, j)] - q[j]).powi(2))
+                        .sum::<f64>()
+                })
                 .sum();
-            let cross_aug: f64 = (0..m)
-                .map(|i| (0..d).map(|j| ty[(i, j)] * stats.px[(i, j)]).sum::<f64>())
-                .sum();
-            // Landmark contributions to the (augmented) sums, plus the raw
-            // landmark residual for reporting.
-            let (mut lm_ypy, mut lm_cross, mut lm_xpx, mut lm_resid2) = (0.0, 0.0, 0.0, 0.0);
-            for (index, q) in &landmarks_work {
-                let ty_norm2 = (0..d).map(|j| ty[(*index, j)].powi(2)).sum::<f64>();
-                let dot = (0..d).map(|j| ty[(*index, j)] * q[j]).sum::<f64>();
-                lm_ypy += landmark_mass * ty_norm2;
-                lm_cross += landmark_mass * dot;
-                lm_xpx += landmark_mass * q.iter().map(|v| v * v).sum::<f64>();
-                lm_resid2 += (0..d)
-                    .map(|j| (ty[(*index, j)] - q[j]).powi(2))
-                    .sum::<f64>();
-            }
-            // Principled (`landmark_sigma`) mode estimates `sigma2` from the
-            // surface correspondences ONLY: drop the landmark energy/mass so the
-            // variance stays a clean surface residual and does not relax the
-            // shape prior. Heuristic (`landmark_weight`) mode keeps the legacy
-            // behavior where landmarks enter the variance too.
             let (xpx, ypy, cross, denom) = if landmark_var_work.is_some() {
-                (
-                    xpx_surface,
-                    ypy_aug - lm_ypy,
-                    cross_aug - lm_cross,
-                    np_surface,
-                )
+                // Principled (`landmark_sigma`) mode: estimate `sigma2` from the
+                // surface correspondences ONLY. Sum the surface p1/px directly —
+                // using the saved pre-augmentation values at the landmark rows and
+                // NEVER forming the large augmented landmark term — so a tight `τ`
+                // (huge mass) cannot swamp the surface signal by cancellation.
+                let mut ypy_surface = 0.0;
+                let mut cross_surface = 0.0;
+                for i in 0..m {
+                    if is_landmark_row[i] {
+                        continue;
+                    }
+                    ypy_surface += stats.p1[i] * (0..d).map(|j| ty[(i, j)].powi(2)).sum::<f64>();
+                    cross_surface += (0..d).map(|j| ty[(i, j)] * stats.px[(i, j)]).sum::<f64>();
+                }
+                for (&index, (surf_p1, surf_px)) in
+                    unique_landmark_rows.iter().zip(&landmark_surface)
+                {
+                    ypy_surface += surf_p1 * (0..d).map(|j| ty[(index, j)].powi(2)).sum::<f64>();
+                    cross_surface += (0..d).map(|j| ty[(index, j)] * surf_px[j]).sum::<f64>();
+                }
+                (xpx_surface, ypy_surface, cross_surface, np_surface)
             } else {
+                // Heuristic (`landmark_weight`) mode keeps the legacy behavior
+                // where landmarks enter the variance too. Here the AUGMENTED sums
+                // are exactly what we want, so there is no cancellation to avoid.
+                let ypy_aug: f64 = (0..m)
+                    .map(|i| stats.p1[i] * (0..d).map(|j| ty[(i, j)].powi(2)).sum::<f64>())
+                    .sum();
+                let cross_aug: f64 = (0..m)
+                    .map(|i| (0..d).map(|j| ty[(i, j)] * stats.px[(i, j)]).sum::<f64>())
+                    .sum();
+                let lm_xpx: f64 = landmarks_work
+                    .iter()
+                    .map(|(_, q)| landmark_mass * q.iter().map(|v| v * v).sum::<f64>())
+                    .sum();
                 (xpx_surface + lm_xpx, ypy_aug, cross_aug, stats.np)
             };
             sigma2 = ((xpx - 2.0 * cross + ypy) / (denom * d as f64)).max(variance_floor);
@@ -1134,5 +1185,53 @@ mod landmark_tests {
         assert!(fit.sigma2.is_finite() && fit.landmark_rms.is_finite());
         assert!(fit.coefficients.iter().all(|c| c.is_finite()));
         assert!(fit.landmark_rms < 1e-3, "landmark_rms {}", fit.landmark_rms);
+    }
+
+    #[test]
+    fn principled_sigma2_survives_extreme_tau_without_cancellation() {
+        // Regression for catastrophic cancellation in the surface-only sigma2.
+        // With an extreme `τ` on large-coordinate data the landmark mass is many
+        // orders of magnitude above the surface mass, so forming the surface
+        // variance as `ypy_aug - lm_ypy` (subtracting the huge augmented landmark
+        // term back out) would lose all precision. Placing CONSISTENT landmarks
+        // (exactly at the landmark-free fit) must leave the principled surface
+        // `sigma2` essentially identical to the landmark-free value.
+        let (source, modes, _) = model();
+        let big = 1.0e3;
+        let src = source.map(|v| v * big);
+        let modes_big = modes.map(|v| v * big);
+        let (c, s) = (0.2_f64.cos(), 0.2_f64.sin());
+        let rmat = DMatrix::from_row_slice(3, 3, &[c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0]);
+        // Rigidly rotated large-scale target plus a small non-model wobble, so
+        // there is a genuine surface residual for sigma2 to measure.
+        let target = DMatrix::from_fn(8, 3, |i, j| {
+            (0..3).map(|q| src[(i, q)] * rmat[(q, j)]).sum::<f64>()
+                + 0.5 * ((i * 3 + j) as f64).sin()
+        });
+        let base = AtlasRegistration::new(&target, &src, &modes_big, sim_config(None, Vec::new()))
+            .unwrap()
+            .register()
+            .unwrap();
+        assert!(base.sigma2 > 0.0 && base.sigma2.is_finite());
+        // Consistent landmarks at the landmark-free fit; `τ = 1e-6` is minuscule
+        // against the ~1e3 coordinate scale, so the landmark mass ~ sigma2/1e-12.
+        let landmarks: Vec<(usize, Vec<f64>)> = [1usize, 4, 6]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| base.points[(i, j)]).collect()))
+            .collect();
+        let tight =
+            AtlasRegistration::new(&target, &src, &modes_big, sim_config(Some(1e-6), landmarks))
+                .unwrap()
+                .register()
+                .unwrap();
+        assert!(tight.sigma2.is_finite() && tight.sigma2 > 0.0);
+        // Surface variance unchanged by the (consistent) anchors to high relative
+        // precision — the direct computation carries the surface signal exactly.
+        assert!(
+            (tight.sigma2 - base.sigma2).abs() < 1e-6 * base.sigma2,
+            "tight {} vs base {}",
+            tight.sigma2,
+            base.sigma2
+        );
     }
 }

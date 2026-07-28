@@ -64,6 +64,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `register_atlas` polish. On the 200-trial benchmark this lifts standalone pose
   success 57% → 79% and the full guided pipeline 84% → 90% (fixes 12 fragments,
   breaks 0). Defaults to `0` (scoring-only, unchanged behavior).
+- The `pose_marginalized_initialization` compatibility wrapper now forwards
+  `landmark_indices` / `landmark_targets` / `landmark_weight` / `landmark_sigma`
+  / `refine_landmark_weight` / `refine_landmark_sigma` to `pose_initialize`, so
+  keypoint guidance is available through the reference-style entry point too.
+
+### Changed
+
+- In `landmark_sigma` mode the surface-only `sigma2` is now accumulated directly
+  from the pre-augmentation (surface) `p1` / `px` at the landmark rows, instead
+  of subtracting the augmented landmark energy back out. For a very tight `τ`
+  (huge landmark mass) or large-coordinate data the old
+  `ypy_aug − landmark_energy` form could lose precision through catastrophic
+  cancellation; the direct sum is exact. Numerically identical away from that
+  regime.
 
 ## [3.0.0] - 2026-07-24
 
