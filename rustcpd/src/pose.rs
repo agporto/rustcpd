@@ -156,7 +156,8 @@ pub struct PoseMarginalizedInitialization {
     /// single run*, and includes the keypoint penalty when landmarks are set.
     /// It is not comparable across runs, across a different keypoint count `k`,
     /// or across a different `τ` / `landmark_weight`; for a cross-fit quality or
-    /// confidence signal use [`AtlasResult::sigma2`] via the calibrator instead.
+    /// confidence signal use [`crate::AtlasResult::sigma2`] via the calibrator
+    /// instead.
     pub score: f64,
     /// Score gap to the runner-up; larger means more decisive. Same within-run
     /// caveat as [`Self::score`].
