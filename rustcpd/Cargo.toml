@@ -1,5 +1,6 @@
 [package]
 name = "rustcpd"
+# Kept in sync with python/Cargo.toml for joint Rust/Python releases.
 version = "3.1.0"
 edition = "2024"
 rust-version = "1.87"
