@@ -333,6 +333,58 @@ def test_pose_initialize_recovers_similarity():
     assert init.hypotheses_refined == 3
 
 
+def test_pose_initialize_can_fix_residual_scale():
+    y = cloud(36)
+    r = rotation_z(0.25)
+    target = y @ r + np.array([0.7, -0.4, 0.2])
+    modes = np.zeros((y.size, 1))
+    init = cpd.pose_initialize(
+        y,
+        target,
+        modes,
+        [1.0],
+        rotation_count=1,
+        coarse_source_count=36,
+        coarse_target_count=36,
+        coarse_rank=1,
+        coarse_iterations=8,
+        refine_count=1,
+        refine_target_count=36,
+        refine_iterations=20,
+        with_scale=False,
+        parallel=False,
+    )
+    points = y @ init.rotation + init.translation
+    assert init.scale == 1.0
+    assert rms(points, target) < 1e-4
+    assert np.linalg.norm(init.translation) > 0.1
+
+
+def test_pose_compatibility_wrapper_forwards_fixed_scale():
+    y = cloud(24)
+    target = y + np.array([0.35, -0.2, 0.1])
+    modes = np.zeros((len(y), 3, 1))
+    init = cpd.pose_marginalized_initialization(
+        y,
+        target,
+        modes,
+        [1.0],
+        rotation_count=1,
+        coarse_source_count=len(y),
+        coarse_target_count=len(y),
+        coarse_rank=1,
+        coarse_iterations=4,
+        coarse_screen_iterations=4,
+        coarse_survivor_count=1,
+        refine_count=1,
+        refine_target_count=len(y),
+        refine_iterations=6,
+        with_scale=False,
+        n_jobs=1,
+    )
+    assert init.scale == 1.0
+
+
 def test_initialize_sigma2_matches_pairwise_definition():
     x, y = cloud(9), cloud(7)
     direct = np.mean(
@@ -509,3 +561,292 @@ def test_atlas_reconstruct_validates():
         result.reconstruct(y, np.zeros((y.size, 3)))  # wrong rank
     with pytest.raises(ValueError):
         result.apply_similarity(np.zeros((5, 2)))  # wrong dim
+
+
+def test_register_atlas_landmarks_improve_underregularized_fit():
+    # Under heavy regularization the plain fit under-shoots the true shape;
+    # the landmark data term pulls the anchored vertices back onto target.
+    y = cloud(40)
+    rank = 2
+    modes = _orthonormal_modes(len(y), rank)[:, :rank]
+    truth = np.array([0.9, -0.7])
+    target = y + (modes @ truth).reshape(y.shape)
+    idx = [1, 12, 27, 33]
+    # A short, fixed EM budget under heavy regularization: the plain fit has
+    # not yet converged (the Mahalanobis prior still bites), while the landmark
+    # data term drives the anchored vertices onto their targets almost at once.
+    common = dict(
+        optimize_similarity=False, with_scale=False,
+        lambda_regularization=6.0, max_iterations=6, tolerance=0.0,
+    )
+    plain = cpd.register_atlas(target, y, modes, [1.0, 1.0], **common)
+    anchored = cpd.register_atlas(
+        target, y, modes, [1.0, 1.0],
+        landmark_indices=idx, landmark_targets=target[idx], landmark_weight=40.0,
+        **common,
+    )
+
+    def resid(res):
+        recon = np.asarray(res.reconstruct(y, modes))
+        return rms(recon[idx], target[idx])
+
+    assert resid(anchored) < 0.25 * resid(plain)
+
+
+def test_register_atlas_landmark_weight_zero_is_noop():
+    y = cloud(30)
+    target = y + 0.05
+    modes = _orthonormal_modes(len(y), 2)[:, :2]
+    common = dict(optimize_similarity=False, lambda_regularization=1.0, max_iterations=120)
+    base = cpd.register_atlas(target, y, modes, [1.0, 1.0], **common)
+    disabled = cpd.register_atlas(
+        target, y, modes, [1.0, 1.0],
+        landmark_indices=[0, 5], landmark_targets=np.zeros((2, 3)),
+        landmark_weight=0.0, **common,
+    )
+    assert np.allclose(base.coefficients, disabled.coefficients, atol=1e-12)
+
+
+def test_register_atlas_landmark_validation():
+    y = cloud(20)
+    modes = _orthonormal_modes(len(y), 2)[:, :2]
+    with pytest.raises(ValueError):  # targets missing
+        cpd.register_atlas(y, y, modes, [1.0, 1.0], landmark_indices=[0], landmark_weight=5.0)
+    with pytest.raises(ValueError):  # length mismatch
+        cpd.register_atlas(
+            y, y, modes, [1.0, 1.0],
+            landmark_indices=[0, 1], landmark_targets=y[:1], landmark_weight=5.0,
+        )
+
+
+def test_pose_initialize_landmarks_guide_basin():
+    y = cloud(30)
+    r = rotation_z(0.7)
+    target = (y @ r) + np.array([0.4, -0.25, 0.15])
+    modes = np.zeros((y.size, 1))
+    idx = [0, 8, 17, 25]
+    init = cpd.pose_initialize(
+        y, target, modes, [1.0],
+        rotation_count=25, coarse_source_count=30, coarse_target_count=30,
+        coarse_rank=1, coarse_iterations=6, coarse_screen_iterations=6,
+        coarse_survivor_count=25, refine_count=4, refine_target_count=30,
+        refine_iterations=20, with_scale=False,
+        landmark_indices=idx, landmark_targets=target[idx], landmark_weight=20.0,
+        parallel=False,
+    )
+    fitted = init.scale * (y[idx] @ init.rotation) + init.translation
+    assert rms(fitted, target[idx]) < 0.08
+
+
+def test_pose_marginalized_wrapper_forwards_landmarks():
+    # The compatibility wrapper must forward keypoints to pose_initialize.
+    y = cloud(30)
+    r = rotation_z(0.7)
+    target = (y @ r) + np.array([0.4, -0.25, 0.15])
+    modes = np.zeros((y.size, 1))
+    idx = [0, 8, 17, 25]
+    common = dict(
+        rotation_count=25, coarse_source_count=30, coarse_target_count=30,
+        coarse_rank=1, coarse_iterations=6, coarse_screen_iterations=6,
+        coarse_survivor_count=25, refine_count=4, refine_target_count=30,
+        refine_iterations=20, with_scale=False, n_jobs=1,
+    )
+    guided = cpd.pose_marginalized_initialization(
+        y, target, modes, [1.0],
+        landmark_indices=idx, landmark_targets=target[idx],
+        landmark_sigma=0.02, refine_landmark_sigma=0.02, **common,
+    )
+    fitted = guided.scale * (y[idx] @ guided.rotation) + guided.translation
+    assert rms(fitted, target[idx]) < 0.08
+    # blind wrapper (no landmarks) is unaffected and still returns a proper pose
+    blind = cpd.pose_marginalized_initialization(y, target, modes, [1.0], **common)
+    assert abs(np.linalg.det(np.asarray(blind.rotation)) - 1.0) < 1e-6
+
+
+def test_pose_initialize_landmark_validation():
+    y = cloud(20)
+    modes = np.zeros((y.size, 1))
+    with pytest.raises(ValueError):
+        cpd.pose_initialize(
+            y, y, modes, [1.0],
+            landmark_indices=[0, 1], landmark_targets=y[:1], landmark_weight=5.0,
+        )
+
+
+def test_pose_confidence_calibrator_maps_sigma2_to_probability():
+    from rustcpd import calibration as cal
+    rng = np.random.default_rng(0)
+    # correct fits have small residual variance, failures large (well separated)
+    good = rng.uniform(1e-5, 1e-4, 60)
+    bad = rng.uniform(1e-2, 1e-1, 40)
+    sigma2 = np.concatenate([good, bad])
+    correct = np.concatenate([np.ones(60), np.zeros(40)]).astype(bool)
+
+    auc = cal.failure_detection_auc(sigma2, correct)
+    assert auc > 0.99  # sigma2 separates the two classes here
+
+    c = cal.PoseConfidenceCalibrator.fit(sigma2, correct)
+    assert c.slope < 0  # lower sigma2 -> higher confidence
+    assert c.probability(good.mean()) > 0.9
+    assert c.probability(bad.mean()) < 0.1
+    # monotone decreasing in sigma2
+    grid = np.array([1e-5, 1e-4, 1e-3, 1e-2, 1e-1])
+    p = c.probability(grid)
+    assert np.all(np.diff(p) < 0)
+    trust = c.trust(sigma2)
+    assert trust[:60].mean() > 0.95 and trust[60:].mean() < 0.05
+
+
+def test_pose_confidence_calibrator_validates():
+    from rustcpd import calibration as cal
+    with pytest.raises(ValueError):  # one class only
+        cal.PoseConfidenceCalibrator.fit(np.array([1e-4, 2e-4]), np.array([True, True]))
+    with pytest.raises(ValueError):  # non-positive sigma2
+        cal.PoseConfidenceCalibrator.fit(np.array([1e-4, 0.0]), np.array([True, False]))
+    with pytest.raises(ValueError):  # AUC needs both classes
+        cal.failure_detection_auc(np.array([1e-4, 2e-4]), np.array([True, True]))
+
+
+def test_pose_initialize_anchored_refinement():
+    y = cloud(40)
+    r = rotation_z(0.6)
+    target = (y @ r) + np.array([0.3, -0.2, 0.1])
+    modes = np.zeros((y.size, 1))
+    idx = [0, 9, 18, 27, 36]
+    common = dict(
+        rotation_count=25, coarse_source_count=40, coarse_target_count=40,
+        coarse_rank=1, coarse_iterations=6, coarse_screen_iterations=6,
+        coarse_survivor_count=25, refine_count=4, refine_source_count=15,
+        refine_target_count=40, refine_iterations=20, with_scale=False,
+        landmark_indices=idx, landmark_targets=target[idx], landmark_weight=15.0,
+        parallel=False,
+    )
+    anchored = cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_weight=25.0, **common)
+    fitted = anchored.scale * (y[idx] @ anchored.rotation) + anchored.translation
+    assert rms(fitted, target[idx]) < 0.05
+    # default (0) is a no-op vs explicitly passing 0
+    a = cpd.pose_initialize(y, target, modes, [1.0], **common)
+    b = cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_weight=0.0, **common)
+    assert np.allclose(np.asarray(a.rotation), np.asarray(b.rotation))
+    with pytest.raises(ValueError):
+        cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_weight=-1.0, **common)
+
+
+def test_register_atlas_landmark_sigma_mode():
+    y = cloud(40)
+    r = rotation_z(0.3)
+    # rigid target plus small non-model surface noise
+    target = (y @ r) + np.array([0.4, -0.2, 0.1]) + 0.01 * np.sin(np.arange(y.size).reshape(y.shape))
+    rank = 2
+    modes = _orthonormal_modes(len(y), rank)[:, :rank]
+    common = dict(optimize_similarity=True, with_scale=False, lambda_regularization=0.5,
+                  max_iterations=200, tolerance=1e-9)
+    base = cpd.register_atlas(target, y, modes, [1.0, 1.0], **common)
+    assert np.isnan(base.landmark_rms)  # no landmarks -> NaN
+    idx = [1, 12, 27]
+    tgt = np.asarray(base.points)[idx]  # consistent landmarks (already satisfied)
+    principled = cpd.register_atlas(target, y, modes, [1.0, 1.0],
+                                    landmark_indices=idx, landmark_targets=tgt,
+                                    landmark_sigma=1e-2, **common)
+    heavy = cpd.register_atlas(target, y, modes, [1.0, 1.0],
+                               landmark_indices=idx, landmark_targets=tgt,
+                               landmark_weight=200.0, **common)
+    assert principled.landmark_rms < 0.02
+    # principled surface sigma2 ~ unchanged; heuristic diluted by landmark mass
+    assert abs(principled.sigma2 - base.sigma2) < 0.1 * base.sigma2
+    assert heavy.sigma2 < 0.5 * base.sigma2
+    # tighter variance anchors harder (smaller landmark residual) on a divergent case
+    tgt2 = target[idx]
+    loose = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                               landmark_targets=tgt2, landmark_sigma=0.2, **common)
+    tight = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                               landmark_targets=tgt2, landmark_sigma=0.02, **common)
+    assert tight.landmark_rms < loose.landmark_rms
+
+
+def test_register_atlas_landmark_sigma_validation():
+    y = cloud(20)
+    modes = _orthonormal_modes(len(y), 2)[:, :2]
+    with pytest.raises(ValueError):
+        cpd.register_atlas(y, y, modes, [1.0, 1.0], landmark_indices=[0],
+                           landmark_targets=y[:1], landmark_sigma=-1.0)
+
+
+def test_pose_initialize_landmark_sigma_scoring_and_refine():
+    y = cloud(30)
+    r = rotation_z(0.6)
+    target = (y @ r) + np.array([0.4, -0.2, 0.1])
+    modes = np.zeros((y.size, 1))
+    idx = [0, 9, 18, 27]
+    common = dict(
+        rotation_count=25, coarse_source_count=30, coarse_target_count=30,
+        coarse_rank=1, coarse_iterations=6, coarse_screen_iterations=6,
+        coarse_survivor_count=25, refine_count=4, refine_source_count=15,
+        refine_target_count=30, refine_iterations=20, with_scale=False,
+        landmark_indices=idx, landmark_targets=target[idx], parallel=False,
+    )
+    # fixed-variance scoring + fixed-variance refinement (fully principled pose)
+    init = cpd.pose_initialize(y, target, modes, [1.0], landmark_sigma=1e-2,
+                               refine_landmark_sigma=1e-2, **common)
+    fitted = init.scale * (y[idx] @ init.rotation) + init.translation
+    assert rms(fitted, target[idx]) < 0.05
+    # scoring-only fixed variance still returns a proper pose
+    scored = cpd.pose_initialize(y, target, modes, [1.0], landmark_sigma=1e-2, **common)
+    assert abs(np.linalg.det(np.asarray(scored.rotation)) - 1.0) < 1e-6
+    with pytest.raises(ValueError):
+        cpd.pose_initialize(y, target, modes, [1.0], landmark_sigma=-1.0, **common)
+    with pytest.raises(ValueError):
+        cpd.pose_initialize(y, target, modes, [1.0], refine_landmark_sigma=-1.0, **common)
+
+
+def test_register_atlas_landmark_sigma_is_scale_equivariant():
+    # landmark_sigma is a standard deviation, so scaling the whole problem by c
+    # and the std by c must recover identical coefficients/rotation, with
+    # translation scaling by c. A unit-free weight would not do this.
+    y = cloud(40)
+    r = rotation_z(0.3)
+    rank = 2
+    modes = _orthonormal_modes(len(y), rank)[:, :rank]
+    truth = np.array([0.6, -0.4])
+    shape = y + (modes @ truth).reshape(y.shape)
+    target = shape @ r
+    idx = [1, 12, 27]
+    common = dict(optimize_similarity=True, with_scale=False,
+                  lambda_regularization=0.3, max_iterations=300, tolerance=1e-11,
+                  normalize=False)
+    unit = cpd.register_atlas(target, y, modes, [1.0, 1.0],
+                              landmark_indices=idx, landmark_targets=target[idx],
+                              landmark_sigma=0.05, **common)
+    c = 2.5
+    scaled = cpd.register_atlas(target * c, y * c, modes * c, [1.0, 1.0],
+                                landmark_indices=idx, landmark_targets=target[idx] * c,
+                                landmark_sigma=0.05 * c, **common)
+    assert np.allclose(unit.coefficients, scaled.coefficients, atol=1e-6)
+    assert np.allclose(np.asarray(unit.rotation), np.asarray(scaled.rotation), atol=1e-6)
+    assert np.allclose(np.asarray(unit.translation) * c, np.asarray(scaled.translation),
+                       atol=1e-6 * c)
+    assert abs(unit.landmark_rms * c - scaled.landmark_rms) < 1e-6 * c
+
+
+def test_register_atlas_landmark_sigma_takes_precedence_over_weight():
+    # Passing BOTH landmark_sigma and landmark_weight behaves like sigma alone:
+    # the fixed-variance term wins and the weight is ignored (no silent blend).
+    y = cloud(40)
+    rank = 2
+    modes = _orthonormal_modes(len(y), rank)[:, :rank]
+    truth = np.array([0.7, -0.5])
+    target = y + (modes @ truth).reshape(y.shape)
+    idx = [1, 12, 27]
+    tgt = target[idx] + 0.05  # inconsistent, so the two branches truly differ
+    common = dict(optimize_similarity=False, lambda_regularization=6.0,
+                  max_iterations=6, tolerance=0.0)
+    sigma_only = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                                    landmark_targets=tgt, landmark_sigma=0.02, **common)
+    both = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                              landmark_targets=tgt, landmark_sigma=0.02,
+                              landmark_weight=123.0, **common)
+    weight_only = cpd.register_atlas(target, y, modes, [1.0, 1.0], landmark_indices=idx,
+                                     landmark_targets=tgt, landmark_weight=123.0, **common)
+    assert np.allclose(sigma_only.coefficients, both.coefficients, atol=1e-12)
+    # and the fixed-variance branch is genuinely different from weight-only
+    assert not np.allclose(sigma_only.coefficients, weight_only.coefficients, atol=1e-6)

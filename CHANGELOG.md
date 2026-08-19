@@ -6,6 +6,81 @@ and the Python package share a version number.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [3.1.0] - 2026-08-18
+
+### Added
+
+- Optional anchored-keypoint (landmark) terms for fragment workflows whose
+  shape diverges from the model mean. `AtlasConfig::landmarks` /
+  `landmark_weight` keep a handful of corresponding vertices anchored as a soft
+  data term through every atlas EM iteration (folded into the E-step
+  sufficient statistics, so they steer both the shape-coefficient and
+  similarity M-steps). `PoseMarginalizedConfig::landmarks` / `landmark_weight`
+  add a keypoint-consistency penalty to every rotation hypothesis, steering the
+  global search toward the keypoint-consistent basin. Both are exposed through
+  the Python `register_atlas` and `pose_initialize` bindings as
+  `landmark_indices` / `landmark_targets` / `landmark_weight`, and are disabled
+  by default (empty `landmarks`, `landmark_weight = 0`).
+- `calibration.PoseConfidenceCalibrator` and `calibration.failure_detection_auc`:
+  turn an atlas fit's residual `sigma2` into a calibrated `P(pose correct)`. A
+  wrong pose basin cannot fit the fragment and leaves a large residual, making
+  `sigma2` a strong unsupervised failure signal; the calibrator fits a 1-D
+  logistic map on `log(sigma2)` from a few labelled fits so callers can flag
+  low-confidence fragments for review or additional keypoints. `sigma2` is
+  dataset-specific, so the map must be recalibrated per problem.
+- `PoseMarginalizedConfig::landmark_sigma` and `refine_landmark_sigma` (Python
+  `pose_initialize(landmark_sigma=..., refine_landmark_sigma=...)`): fixed
+  keypoint-localization-*std* `τ` forms of the pose scoring penalty and the
+  refinement anchoring (the value is squared to a variance `τ²` internally),
+  matching the atlas `landmark_sigma`. The scoring penalty becomes
+  `0.5 · ‖fitted − target‖² / τ²` (a fixed landmark precision, independent of
+  `sigma2`) and the refinement forwards the std into the atlas `landmark_sigma`.
+  With these set, the whole pipeline — basin scoring → refinement → atlas
+  polish — uses one fixed-variance model with a single physical `τ`. When both
+  a `*_sigma` and a `*_weight` are supplied the fixed-variance `*_sigma` takes
+  precedence. `landmark_weight` / `refine_landmark_weight` are retained as
+  heuristic fallbacks (default behavior unchanged).
+- `AtlasConfig::landmark_sigma` (Python `register_atlas(landmark_sigma=...)`):
+  a principled alternative to `landmark_weight`. It is a keypoint-localization
+  *standard deviation* `τ` (target-coordinate units, squared to a variance `τ²`
+  internally); pick it to reflect both annotation noise and, for sparse
+  keypoints, the shape-model truncation error at that vertex. Each landmark is
+  folded in with mass `a = sigma2 / τ²`, giving a *fixed* effective landmark
+  variance independent of annealing — the `DeformableConfig::constraint_error`
+  scheme, which the heuristic weight did not follow. When both `landmark_sigma`
+  and `landmark_weight` are set, `landmark_sigma` takes precedence. Surface
+  `sigma2` is then estimated from the ordinary CPD correspondences only, so
+  `AtlasResult.sigma2` stays a clean surface-residual statistic whose meaning
+  does not shift with landmark count/weight/noise for a given fit.
+  `AtlasResult.landmark_rms` reports the landmark fit separately. On a 200-trial
+  corner benchmark the principled mode matches or beats the heuristic weight
+  (99% [96,100] at τ = the true keypoint-noise level, vs 96% best for the
+  weight) and the surface `sigma2` is minimized at that physically-correct τ.
+  `landmark_weight` is retained as an explicitly heuristic alternative.
+- `PoseMarginalizedConfig::refine_landmark_weight` (Python
+  `pose_initialize(refine_landmark_weight=...)`): anchors the keypoints during
+  the refinement EM, not only in hypothesis scoring, so `pose_initialize`
+  returns a keypoint-anchored pose on its own rather than relying on a following
+  `register_atlas` polish. On the 200-trial benchmark this lifts standalone pose
+  success 57% → 79% and the full guided pipeline 84% → 90% (fixes 12 fragments,
+  breaks 0). Defaults to `0` (scoring-only, unchanged behavior).
+- The `pose_marginalized_initialization` compatibility wrapper now forwards
+  `landmark_indices` / `landmark_targets` / `landmark_weight` / `landmark_sigma`
+  / `refine_landmark_weight` / `refine_landmark_sigma` to `pose_initialize`, so
+  keypoint guidance is available through the reference-style entry point too.
+
+### Changed
+
+- In `landmark_sigma` mode the surface-only `sigma2` is now accumulated directly
+  from the pre-augmentation (surface) `p1` / `px` at the landmark rows, instead
+  of subtracting the augmented landmark energy back out. For a very tight `τ`
+  (huge landmark mass) or large-coordinate data the old
+  `ypy_aug − landmark_energy` form could lose precision through catastrophic
+  cancellation; the direct sum is exact. Numerically identical away from that
+  regime.
+
 ## [3.0.0] - 2026-07-24
 
 ### Changed
@@ -300,6 +375,7 @@ faster. Numerical agreement with the original is ≤ 3e-12 relative across a
 parity suite covering every registration family. See
 [`rustcpd/BENCHMARKS.md`](rustcpd/BENCHMARKS.md).
 
+[3.1.0]: https://github.com/agporto/rustcpd/releases/tag/v3.1.0
 [3.0.0]: https://github.com/agporto/rustcpd/releases/tag/v3.0.0
 
 <!-- 2.1.0 and earlier predate the public repository and have no tags. -->

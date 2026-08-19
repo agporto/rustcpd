@@ -59,6 +59,46 @@ pub struct PoseMarginalizedConfig {
     pub outlier_weight: f64,
     /// Prior probability of the identity rotation, in `(0, 1)`.
     pub identity_prior_probability: f64,
+    /// Anchored keypoint correspondences steering the global search: each
+    /// entry pairs a source-model vertex index with its known target
+    /// coordinate. Every hypothesis pays a penalty proportional to how far it
+    /// leaves these vertices from their targets, so screening, survivor
+    /// selection, and refinement all prefer the keypoint-consistent basin —
+    /// the discrete decision local refinement alone cannot revisit. Empty
+    /// (default) disables the term.
+    pub landmarks: Vec<(usize, Vec<f64>)>,
+    /// Heuristic weight of the keypoint scoring penalty, in units of effective
+    /// target points per landmark (the penalty is `0.5 · landmark_weight ·
+    /// ‖fitted − target‖² / sigma2`). Because it divides by `sigma2`, the
+    /// effective landmark variance is `sigma2 / landmark_weight`, which drifts
+    /// with annealing. Prefer [`Self::landmark_sigma`]. `0` disables it.
+    pub landmark_weight: f64,
+    /// Fixed keypoint localization standard deviation `τ` (a distance) for the
+    /// scoring penalty, the principled alternative to [`Self::landmark_weight`].
+    /// When `Some`, each hypothesis pays `0.5 · ‖fitted − target‖² / τ²` — a
+    /// fixed landmark precision independent of `sigma2`, matching the atlas
+    /// [`crate::AtlasConfig::landmark_sigma`]. Takes precedence over
+    /// `landmark_weight`. `None` (default) keeps the heuristic weight.
+    pub landmark_sigma: Option<f64>,
+    /// Anchor the keypoints during the refinement EM as well, using the atlas
+    /// heuristic [`crate::AtlasConfig::landmark_weight`] gain. With the default
+    /// `0`, keypoints only *score* hypotheses — they choose the basin but do
+    /// not hold the refined fit in place; a following anchored `register_atlas`
+    /// polish is then expected to supply that. Setting this makes `initialize`
+    /// return a keypoint-anchored result on its own. Landmark vertices are
+    /// always retained in the refinement source subsample when enabled.
+    pub refine_landmark_weight: f64,
+    /// Fixed-std alternative to [`Self::refine_landmark_weight`]: anchors the
+    /// refinement EM through the atlas [`crate::AtlasConfig::landmark_sigma`]
+    /// with localization std `τ`. Takes precedence over
+    /// `refine_landmark_weight`. `None` (default) uses the heuristic weight.
+    pub refine_landmark_sigma: Option<f64>,
+    /// Include a residual isotropic scale in each pose hypothesis.
+    ///
+    /// Set this to `false` when the source and modes have already been
+    /// pre-scaled from an external physical-size estimate. Rotation and
+    /// translation remain optimized.
+    pub with_scale: bool,
     /// Offset applied to the low-discrepancy rotation sequence.
     pub seed: u64,
     /// Evaluate hypotheses on the crate's Rayon pool.
@@ -86,6 +126,12 @@ impl Default for PoseMarginalizedConfig {
             lambda_regularization: 0.1,
             outlier_weight: 0.05,
             identity_prior_probability: 0.2,
+            landmarks: Vec::new(),
+            landmark_weight: 0.0,
+            landmark_sigma: None,
+            refine_landmark_weight: 0.0,
+            refine_landmark_sigma: None,
+            with_scale: true,
             seed: 0,
             parallel: true,
             single_precision: false,
@@ -105,9 +151,16 @@ pub struct PoseMarginalizedInitialization {
     pub scale: f64,
     /// Translation of the winning hypothesis.
     pub translation: Vec<f64>,
-    /// Negative-log-posterior score of the winner (lower is better).
+    /// Negative-log-posterior score of the winner (lower is better). This is an
+    /// unnormalized comparative quantity — it only ranks hypotheses *within a
+    /// single run*, and includes the keypoint penalty when landmarks are set.
+    /// It is not comparable across runs, across a different keypoint count `k`,
+    /// or across a different `τ` / `landmark_weight`; for a cross-fit quality or
+    /// confidence signal use [`crate::AtlasResult::sigma2`] via the calibrator
+    /// instead.
     pub score: f64,
-    /// Score gap to the runner-up; larger means more decisive.
+    /// Score gap to the runner-up; larger means more decisive. Same within-run
+    /// caveat as [`Self::score`].
     pub score_margin: f64,
     /// Shannon entropy of the refined-hypothesis posterior.
     pub posterior_entropy: f64,
@@ -162,7 +215,7 @@ impl PoseMarginalizedConfig {
                     nonidentity_prior
                 };
                 let (scale, translation) =
-                    initial_similarity(&coarse_source, &coarse_target, rotation);
+                    initial_similarity(&coarse_source, &coarse_target, rotation, self.with_scale);
                 let config = AtlasConfig {
                     em: EmConfig {
                         max_iterations: max_iters,
@@ -176,7 +229,7 @@ impl PoseMarginalizedConfig {
                     lambda_regularization: self.lambda_regularization,
                     normalize: true,
                     optimize_similarity: true,
-                    with_scale: true,
+                    with_scale: self.with_scale,
                     initial_rotation: Some(rotation.clone()),
                     initial_scale: scale,
                     initial_translation: Some(translation),
@@ -211,9 +264,18 @@ impl PoseMarginalizedConfig {
                         result.negative_log_likelihood + shape_cost
                     }
                 };
+                let kp_penalty = self.keypoint_penalty(
+                    source,
+                    modes,
+                    &result.coefficients,
+                    &result.rotation,
+                    result.scale,
+                    &result.translation,
+                    result.sigma2,
+                );
                 Ok(Candidate {
                     index,
-                    score: data_cost - prior.ln(),
+                    score: data_cost - prior.ln() + kp_penalty,
                     coefficients: result.coefficients,
                     rotation: result.rotation,
                     scale: result.scale,
@@ -263,7 +325,30 @@ impl PoseMarginalizedConfig {
             }
         }
         let target_indices = subset_indices(target, Some(self.refine_target_count));
-        let source_indices = subset_indices(source, self.refine_source_count);
+        let mut source_indices = subset_indices(source, self.refine_source_count);
+        // Anchored refinement needs every landmark vertex present in the
+        // refinement subsample, with its landmark index remapped from the
+        // full-source row to its subsample position.
+        let anchor_refine = (self.refine_landmark_weight > 0.0
+            || self.refine_landmark_sigma.is_some())
+            && !self.landmarks.is_empty();
+        let refine_landmarks: Vec<(usize, Vec<f64>)> = if anchor_refine {
+            self.landmarks
+                .iter()
+                .map(|(index, point)| {
+                    let position = source_indices
+                        .iter()
+                        .position(|&s| s == *index)
+                        .unwrap_or_else(|| {
+                            source_indices.push(*index);
+                            source_indices.len() - 1
+                        });
+                    (position, point.clone())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let refined_target = select_rows(target, &target_indices);
         let refined_source = select_rows(source, &source_indices);
         let refined_modes = select_modes(modes, source.ncols(), &source_indices, eigenvalues.len());
@@ -283,12 +368,15 @@ impl PoseMarginalizedConfig {
                 lambda_regularization: self.lambda_regularization,
                 normalize: true,
                 optimize_similarity: true,
-                with_scale: true,
+                with_scale: self.with_scale,
                 kdtree_radius_scale: None,
                 initial_coefficients: Some(coefficients),
                 initial_rotation: Some(initial.rotation.clone()),
                 initial_scale: initial.scale,
                 initial_translation: Some(initial.translation.clone()),
+                landmarks: refine_landmarks.clone(),
+                landmark_weight: self.refine_landmark_weight,
+                landmark_sigma: self.refine_landmark_sigma,
             };
             let result =
                 AtlasRegistration::new(&refined_target, &refined_source, &refined_modes, config)?
@@ -309,7 +397,16 @@ impl PoseMarginalizedConfig {
                 &result.coefficients,
                 eigenvalues,
                 self.lambda_regularization,
-            ) + initial.prior_cost;
+            ) + initial.prior_cost
+                + self.keypoint_penalty(
+                    source,
+                    modes,
+                    &result.coefficients,
+                    &result.rotation,
+                    result.scale,
+                    &result.translation,
+                    result.sigma2,
+                );
             Ok(Candidate {
                 index: initial.index,
                 score,
@@ -355,6 +452,43 @@ impl PoseMarginalizedConfig {
         })
     }
 
+    /// Keypoint-consistency penalty for one hypothesis, in the same "nats" as
+    /// the per-point CPD data cost. With [`Self::landmark_sigma`] `= τ` (a std,
+    /// squared internally) it is `0.5 · ‖·‖² / τ²` (fixed landmark precision,
+    /// independent of `sigma2`); otherwise it falls back to
+    /// the heuristic `0.5 · landmark_weight · ‖·‖² / sigma2`. Zero when the term
+    /// is disabled.
+    #[allow(clippy::too_many_arguments)]
+    fn keypoint_penalty(
+        &self,
+        source: &DMatrix<f64>,
+        modes: &DMatrix<f64>,
+        coefficients: &[f64],
+        rotation: &DMatrix<f64>,
+        scale: f64,
+        translation: &[f64],
+        sigma2: f64,
+    ) -> f64 {
+        let active = !self.landmarks.is_empty()
+            && (self.landmark_sigma.is_some() || self.landmark_weight > 0.0);
+        if !active {
+            return 0.0;
+        }
+        let residual = landmark_residual_sq(
+            source,
+            modes,
+            coefficients,
+            rotation,
+            scale,
+            translation,
+            &self.landmarks,
+        );
+        match self.landmark_sigma {
+            Some(sigma) => 0.5 * residual / (sigma * sigma).max(f64::MIN_POSITIVE),
+            None => 0.5 * self.landmark_weight * residual / sigma2.max(f64::MIN_POSITIVE),
+        }
+    }
+
     fn validate(
         &self,
         source: &DMatrix<f64>,
@@ -391,6 +525,32 @@ impl PoseMarginalizedConfig {
             || self.identity_prior_probability == 0.0
         {
             return Err(Error::InvalidOutlierWeight);
+        }
+        if !self.landmark_weight.is_finite() || self.landmark_weight < 0.0 {
+            return Err(Error::PositiveParameter("landmark_weight"));
+        }
+        if self
+            .landmark_sigma
+            .is_some_and(|t2| !t2.is_finite() || t2 <= 0.0)
+        {
+            return Err(Error::PositiveParameter("landmark_sigma"));
+        }
+        if !self.refine_landmark_weight.is_finite() || self.refine_landmark_weight < 0.0 {
+            return Err(Error::PositiveParameter("refine_landmark_weight"));
+        }
+        if self
+            .refine_landmark_sigma
+            .is_some_and(|t2| !t2.is_finite() || t2 <= 0.0)
+        {
+            return Err(Error::PositiveParameter("refine_landmark_sigma"));
+        }
+        for (index, point) in &self.landmarks {
+            if *index >= source.nrows()
+                || point.len() != source.ncols()
+                || !point.iter().all(|value| value.is_finite())
+            {
+                return Err(Error::InvalidShape("landmarks"));
+            }
         }
         Ok(())
     }
@@ -516,26 +676,49 @@ fn select_survivor_indices(screened: &[Candidate], count: usize) -> Vec<usize> {
     }
     survivors
 }
-fn initial_similarity(s: &DMatrix<f64>, t: &DMatrix<f64>, r: &DMatrix<f64>) -> (f64, Vec<f64>) {
-    let sm: Vec<_> = (0..3)
-        .map(|j| (0..s.nrows()).map(|i| s[(i, j)]).sum::<f64>() / s.nrows() as f64)
+fn initial_similarity(
+    source: &DMatrix<f64>,
+    target: &DMatrix<f64>,
+    rotation: &DMatrix<f64>,
+    with_scale: bool,
+) -> (f64, Vec<f64>) {
+    let source_centroid: Vec<_> = (0..3)
+        .map(|j| (0..source.nrows()).map(|i| source[(i, j)]).sum::<f64>() / source.nrows() as f64)
         .collect();
-    let tm: Vec<_> = (0..3)
-        .map(|j| (0..t.nrows()).map(|i| t[(i, j)]).sum::<f64>() / t.nrows() as f64)
+    let target_centroid: Vec<_> = (0..3)
+        .map(|j| (0..target.nrows()).map(|i| target[(i, j)]).sum::<f64>() / target.nrows() as f64)
         .collect();
-    let sr = ((0..s.nrows())
-        .map(|i| (0..3).map(|j| (s[(i, j)] - sm[j]).powi(2)).sum::<f64>())
-        .sum::<f64>()
-        / s.nrows() as f64)
-        .sqrt();
-    let tr = ((0..t.nrows())
-        .map(|i| (0..3).map(|j| (t[(i, j)] - tm[j]).powi(2)).sum::<f64>())
-        .sum::<f64>()
-        / t.nrows() as f64)
-        .sqrt();
-    let scale = tr / sr.max(f64::EPSILON);
+    let scale = if with_scale {
+        let source_radius = ((0..source.nrows())
+            .map(|i| {
+                (0..3)
+                    .map(|j| (source[(i, j)] - source_centroid[j]).powi(2))
+                    .sum::<f64>()
+            })
+            .sum::<f64>()
+            / source.nrows() as f64)
+            .sqrt();
+        let target_radius = ((0..target.nrows())
+            .map(|i| {
+                (0..3)
+                    .map(|j| (target[(i, j)] - target_centroid[j]).powi(2))
+                    .sum::<f64>()
+            })
+            .sum::<f64>()
+            / target.nrows() as f64)
+            .sqrt();
+        target_radius / source_radius.max(f64::EPSILON)
+    } else {
+        1.0
+    };
     let translation = (0..3)
-        .map(|j| tm[j] - scale * (0..3).map(|q| sm[q] * r[(q, j)]).sum::<f64>())
+        .map(|j| {
+            target_centroid[j]
+                - scale
+                    * (0..3)
+                        .map(|q| source_centroid[q] * rotation[(q, j)])
+                        .sum::<f64>()
+        })
         .collect();
     (scale, translation)
 }
@@ -553,6 +736,43 @@ fn apply_model(
     DMatrix::from_fn(s.nrows(), 3, |i, j| {
         scale * (0..3).map(|q| deformed[(i, q)] * r[(q, j)]).sum::<f64>() + t[j]
     })
+}
+
+/// Sum of squared distances between each landmark source vertex — deformed by
+/// `b` and mapped through the similarity `(r, scale, t)` — and its target
+/// coordinate. Evaluates only the landmark rows straight from the full
+/// `source`/`modes`, so it needs no subsample bookkeeping.
+fn landmark_residual_sq(
+    source: &DMatrix<f64>,
+    modes: &DMatrix<f64>,
+    b: &[f64],
+    r: &DMatrix<f64>,
+    scale: f64,
+    t: &[f64],
+    landmarks: &[(usize, Vec<f64>)],
+) -> f64 {
+    let d = source.ncols();
+    landmarks
+        .iter()
+        .map(|(index, target)| {
+            (0..d)
+                .map(|j| {
+                    let fitted = scale
+                        * (0..d)
+                            .map(|q| {
+                                (source[(*index, q)]
+                                    + (0..b.len())
+                                        .map(|k| modes[(index * d + q, k)] * b[k])
+                                        .sum::<f64>())
+                                    * r[(q, j)]
+                            })
+                            .sum::<f64>()
+                        + t[j];
+                    (fitted - target[j]).powi(2)
+                })
+                .sum::<f64>()
+        })
+        .sum()
 }
 fn score_candidate(
     x: &DMatrix<f64>,
@@ -611,7 +831,9 @@ fn score_candidate(
 
 #[cfg(test)]
 mod tests {
-    use super::{axis_angle, quaternion_matrix, rotation_lattice};
+    use super::{
+        PoseMarginalizedConfig, axis_angle, initial_similarity, quaternion_matrix, rotation_lattice,
+    };
     use nalgebra::DMatrix;
 
     fn is_proper_rotation(r: &DMatrix<f64>) -> bool {
@@ -626,6 +848,85 @@ mod tests {
             })
         });
         orthonormal && (r.determinant() - 1.0).abs() < 1e-9
+    }
+
+    #[test]
+    fn fixed_scale_initialization_uses_centroid_translation_for_a_fragment() {
+        let source = DMatrix::from_row_slice(
+            6,
+            3,
+            &[
+                -2.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0,
+                2.0, 0.0,
+            ],
+        );
+        let fragment =
+            DMatrix::from_row_slice(3, 3, &[3.0, -2.0, 0.5, 4.0, -2.0, 0.5, 3.0, -1.0, 0.5]);
+        let rotation = DMatrix::identity(3, 3);
+        let (free_scale, _) = initial_similarity(&source, &fragment, &rotation, true);
+        let (fixed_scale, translation) = initial_similarity(&source, &fragment, &rotation, false);
+
+        assert!(
+            free_scale < 0.75,
+            "free scale did not contract: {free_scale}"
+        );
+        assert_eq!(fixed_scale, 1.0);
+
+        let source_centroid = [0.0, 1.0 / 3.0, 0.0];
+        let fragment_centroid = [10.0 / 3.0, -5.0 / 3.0, 0.5];
+        for j in 0..3 {
+            assert!((source_centroid[j] + translation[j] - fragment_centroid[j]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn fixed_scale_pose_still_optimizes_rotation_and_translation() {
+        let source = DMatrix::from_row_slice(
+            8,
+            3,
+            &[
+                -1.4, -0.2, 0.1, -0.7, 0.9, -0.3, 0.1, -1.1, 0.4, 0.8, 0.2, 0.7, 1.5, 1.0, -0.4,
+                -1.0, 1.4, 0.8, 0.4, -0.6, -0.9, 1.1, -0.8, 0.2,
+            ],
+        );
+        let rotation = axis_angle([0.0, 0.0, 1.0], 0.25);
+        let offset = [0.7, -0.4, 0.2];
+        let target = DMatrix::from_fn(source.nrows(), 3, |i, j| {
+            (0..3)
+                .map(|q| source[(i, q)] * rotation[(q, j)])
+                .sum::<f64>()
+                + offset[j]
+        });
+        let modes = DMatrix::zeros(source.len(), 1);
+        let result = PoseMarginalizedConfig {
+            rotation_count: 1,
+            coarse_source_count: source.nrows(),
+            coarse_target_count: target.nrows(),
+            coarse_rank: 1,
+            coarse_iterations: 8,
+            coarse_screen_iterations: 8,
+            coarse_survivor_count: 1,
+            refine_count: 1,
+            refine_source_count: None,
+            refine_target_count: target.nrows(),
+            refine_iterations: 20,
+            with_scale: false,
+            parallel: false,
+            ..Default::default()
+        }
+        .initialize(&source, &target, &modes, &[1.0])
+        .unwrap();
+
+        assert_eq!(result.scale, 1.0);
+        let fitted = DMatrix::from_fn(source.nrows(), 3, |i, j| {
+            (0..3)
+                .map(|q| source[(i, q)] * result.rotation[(q, j)])
+                .sum::<f64>()
+                + result.translation[j]
+        });
+        let rms = (fitted - target).norm() / (source.len() as f64).sqrt();
+        assert!(rms < 1e-4, "fixed-scale pose RMS was {rms}");
+        assert!(result.translation.iter().any(|value| value.abs() > 0.1));
     }
 
     #[test]
@@ -663,5 +964,371 @@ mod tests {
         let c = 40.0_f64.to_radians().cos();
         let s = 40.0_f64.to_radians().sin();
         assert!((a[(0, 0)] - c).abs() < 1e-12 && (a[(1, 0)] - s).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod landmark_pose_tests {
+    use super::{PoseMarginalizedConfig, axis_angle};
+    use nalgebra::DMatrix;
+
+    fn is_proper(r: &DMatrix<f64>) -> bool {
+        let gram = r.transpose() * r;
+        let ortho = (0..3).all(|i| (0..3).all(|j| (gram[(i, j)] - f64::from(i == j)).abs() < 1e-8));
+        ortho && (r.determinant() - 1.0).abs() < 1e-8
+    }
+
+    // 30-point deterministic source with a rank-1 mode basis.
+    fn model() -> (DMatrix<f64>, DMatrix<f64>, Vec<f64>) {
+        let source = DMatrix::from_fn(30, 3, |i, j| {
+            let z = i as f64 + 1.0;
+            match j {
+                0 => (z * 0.37).sin() * 1.7 + 0.02 * z,
+                1 => (z * 0.23).cos() * 0.9,
+                _ => (z * 0.11).sin() * (z * 0.07).cos(),
+            }
+        });
+        let modes = DMatrix::from_fn(30 * 3, 1, |row, _| ((row as f64 + 1.0) * 0.17).sin() * 0.3);
+        (source, modes, vec![1.0])
+    }
+
+    fn config(landmarks: Vec<(usize, Vec<f64>)>, weight: f64) -> PoseMarginalizedConfig {
+        PoseMarginalizedConfig {
+            rotation_count: 25,
+            coarse_source_count: 30,
+            coarse_target_count: 30,
+            coarse_rank: 1,
+            coarse_iterations: 6,
+            coarse_screen_iterations: 6,
+            coarse_survivor_count: 25,
+            refine_count: 4,
+            refine_source_count: None,
+            refine_target_count: 30,
+            refine_iterations: 20,
+            with_scale: false,
+            parallel: false,
+            landmarks,
+            landmark_weight: weight,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn keypoints_guide_pose_to_consistent_basin() {
+        let (source, modes, ev) = model();
+        let r = axis_angle([0.2, -0.3, 0.9], 0.7);
+        let t = [0.4_f64, -0.25, 0.15];
+        let target = DMatrix::from_fn(30, 3, |i, j| {
+            (0..3).map(|q| source[(i, q)] * r[(q, j)]).sum::<f64>() + t[j]
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [0usize, 8, 17, 25]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+
+        let init = config(landmarks.clone(), 20.0)
+            .initialize(&source, &target, &modes, &ev)
+            .unwrap();
+        assert!(is_proper(&init.rotation));
+        // Every anchored keypoint lands on its target under the recovered pose.
+        let mut worst = 0.0_f64;
+        for (i, q) in &landmarks {
+            for (j, qj) in q.iter().enumerate() {
+                let fitted = init.scale
+                    * (0..3)
+                        .map(|s| source[(*i, s)] * init.rotation[(s, j)])
+                        .sum::<f64>()
+                    + init.translation[j];
+                worst = worst.max((fitted - qj).abs());
+            }
+        }
+        assert!(worst < 0.05, "worst keypoint miss {worst}");
+    }
+
+    #[test]
+    fn landmark_sigma_scoring_and_refinement_recover() {
+        let (source, modes, ev) = model();
+        let r = axis_angle([0.2, -0.3, 0.9], 0.7);
+        let t = [0.4_f64, -0.25, 0.15];
+        let target = DMatrix::from_fn(30, 3, |i, j| {
+            (0..3).map(|q| source[(i, q)] * r[(q, j)]).sum::<f64>() + t[j]
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [0usize, 8, 17, 25]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+        // Fixed-variance scoring AND fixed-variance refinement, with a reduced
+        // refinement subsample to exercise the landmark remap path.
+        let mut cfg = config(landmarks.clone(), 0.0);
+        cfg.landmark_sigma = Some(1e-2);
+        cfg.refine_landmark_sigma = Some(1e-2);
+        cfg.refine_source_count = Some(12);
+        let init = cfg.initialize(&source, &target, &modes, &ev).unwrap();
+        assert!(is_proper(&init.rotation));
+        let mut worst = 0.0_f64;
+        for (i, q) in &landmarks {
+            for (j, qj) in q.iter().enumerate() {
+                let fitted = init.scale
+                    * (0..3)
+                        .map(|s| source[(*i, s)] * init.rotation[(s, j)])
+                        .sum::<f64>()
+                    + init.translation[j];
+                worst = worst.max((fitted - qj).abs());
+            }
+        }
+        assert!(worst < 0.05, "worst keypoint miss {worst}");
+        // A negative fixed variance (scoring or refinement) is rejected.
+        let mut bad = config(landmarks.clone(), 0.0);
+        bad.landmark_sigma = Some(-1.0);
+        assert!(bad.initialize(&source, &target, &modes, &ev).is_err());
+        let mut bad2 = config(landmarks, 0.0);
+        bad2.refine_landmark_sigma = Some(-1.0);
+        assert!(bad2.initialize(&source, &target, &modes, &ev).is_err());
+    }
+
+    #[test]
+    fn zero_landmark_weight_matches_no_landmarks() {
+        let (source, modes, ev) = model();
+        let target = DMatrix::from_fn(30, 3, |i, j| source[(i, j)] + 0.3 * (j as f64) - 0.1);
+        let plain = config(Vec::new(), 0.0)
+            .initialize(&source, &target, &modes, &ev)
+            .unwrap();
+        // Landmarks provided but weight 0 must reproduce the no-landmark winner.
+        let disabled = config(
+            vec![(0, vec![1.0, 2.0, 3.0]), (10, vec![0.0, 0.0, 0.0])],
+            0.0,
+        )
+        .initialize(&source, &target, &modes, &ev)
+        .unwrap();
+        assert!((&plain.rotation - &disabled.rotation).amax() < 1e-12);
+        for (a, b) in plain.translation.iter().zip(&disabled.translation) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn anchored_refinement_recovers_and_is_off_by_default() {
+        let (source, modes, ev) = model();
+        let r = axis_angle([0.1, 0.2, 0.97], 0.9);
+        let t = [0.3_f64, -0.2, 0.15];
+        let target = DMatrix::from_fn(30, 3, |i, j| {
+            (0..3).map(|q| source[(i, q)] * r[(q, j)]).sum::<f64>() + t[j]
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [2usize, 9, 14, 21, 27]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+        // Force the refinement subsample to drop points so the landmark index
+        // remap / extend path runs (refine_source_count < source rows, and
+        // some landmark vertices fall outside the farthest-point subsample).
+        let mut cfg = config(landmarks.clone(), 20.0);
+        cfg.refine_source_count = Some(12);
+        cfg.refine_landmark_weight = 25.0;
+        let anchored = cfg.initialize(&source, &target, &modes, &ev).unwrap();
+        assert!(is_proper(&anchored.rotation));
+        let mut worst = 0.0_f64;
+        for (i, q) in &landmarks {
+            for (j, qj) in q.iter().enumerate() {
+                let fitted = anchored.scale
+                    * (0..3)
+                        .map(|s| source[(*i, s)] * anchored.rotation[(s, j)])
+                        .sum::<f64>()
+                    + anchored.translation[j];
+                worst = worst.max((fitted - qj).abs());
+            }
+        }
+        assert!(worst < 0.05, "anchored refinement keypoint miss {worst}");
+
+        // refine_landmark_weight defaults to 0 and then has no effect.
+        let mut off = config(landmarks, 20.0);
+        off.refine_source_count = Some(12);
+        let base = off
+            .clone()
+            .initialize(&source, &target, &modes, &ev)
+            .unwrap();
+        assert_eq!(off.refine_landmark_weight, 0.0);
+        // A negative refine weight is rejected.
+        let mut bad = off.clone();
+        bad.refine_landmark_weight = -1.0;
+        assert!(bad.initialize(&source, &target, &modes, &ev).is_err());
+        // Sanity: the off run still returns a proper rotation.
+        assert!(is_proper(&base.rotation));
+    }
+
+    #[test]
+    fn pose_rejects_invalid_landmarks() {
+        let (source, modes, ev) = model();
+        let target = source.clone();
+        assert!(
+            config(vec![(999, vec![0.0, 0.0, 0.0])], 5.0)
+                .initialize(&source, &target, &modes, &ev)
+                .is_err()
+        );
+        assert!(
+            config(vec![(0, vec![0.0, 0.0])], 5.0)
+                .initialize(&source, &target, &modes, &ev)
+                .is_err()
+        );
+        assert!(
+            config(vec![(0, vec![0.0, 0.0, 0.0])], -2.0)
+                .initialize(&source, &target, &modes, &ev)
+                .is_err()
+        );
+    }
+
+    // Geodesic angle (degrees) between two rotation matrices.
+    fn rotation_error_deg(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
+        let m = a.transpose() * b;
+        let trace = (0..3).map(|i| m[(i, i)]).sum::<f64>();
+        (((trace - 1.0) / 2.0).clamp(-1.0, 1.0)).acos().to_degrees()
+    }
+
+    #[test]
+    fn keypoint_penalty_is_fixed_variance_sigma2_independent() {
+        // Exercises the scoring term directly. The fixed-variance branch
+        // (`landmark_sigma = τ`) uses precision `1/τ²` and must NOT read the
+        // annealing `sigma2` at all; the heuristic-weight branch scales as
+        // `1/sigma2`. Also covers precedence (both set → fixed wins) and the
+        // tiny-variance guard (finite score for an absurdly small τ).
+        let (source, modes, _) = model();
+        let ident = DMatrix::<f64>::identity(3, 3);
+        let b = [0.0];
+        let t = [0.0_f64, 0.0, 0.0];
+        // Slightly offset landmarks so the residual is strictly positive.
+        let landmarks: Vec<(usize, Vec<f64>)> = [0usize, 8, 17]
+            .iter()
+            .map(|&i| {
+                (
+                    i,
+                    vec![source[(i, 0)] + 0.1, source[(i, 1)], source[(i, 2)]],
+                )
+            })
+            .collect();
+
+        let mut fixed = config(landmarks.clone(), 0.0);
+        fixed.landmark_sigma = Some(0.05);
+        let p_lo = fixed.keypoint_penalty(&source, &modes, &b, &ident, 1.0, &t, 1e-4);
+        let p_hi = fixed.keypoint_penalty(&source, &modes, &b, &ident, 1.0, &t, 9.0);
+        assert!(p_lo > 0.0);
+        assert!(
+            (p_lo - p_hi).abs() < 1e-12,
+            "fixed-variance penalty moved with sigma2: {p_lo} vs {p_hi}"
+        );
+
+        // Heuristic weight penalty tracks 1/sigma2 (the coupling the
+        // reformulation removes): a 9e4× larger sigma2 shrinks it ~9e4×.
+        let heur = config(landmarks.clone(), 10.0);
+        let h_lo = heur.keypoint_penalty(&source, &modes, &b, &ident, 1.0, &t, 1e-4);
+        let h_hi = heur.keypoint_penalty(&source, &modes, &b, &ident, 1.0, &t, 9.0);
+        assert!(
+            h_lo > 100.0 * h_hi,
+            "heuristic penalty should scale with 1/sigma2"
+        );
+
+        // Precedence: both set → fixed-variance branch wins, weight ignored.
+        let mut both = config(landmarks.clone(), 10.0);
+        both.landmark_sigma = Some(0.05);
+        let p_both = both.keypoint_penalty(&source, &modes, &b, &ident, 1.0, &t, 1e-4);
+        assert!(
+            (p_both - p_lo).abs() < 1e-12,
+            "precedence: {p_both} vs {p_lo}"
+        );
+
+        // Tiny finite variance stays finite (the .max(MIN_POSITIVE) guard).
+        let mut tiny = config(landmarks, 0.0);
+        tiny.landmark_sigma = Some(1e-12);
+        let p_tiny = tiny.keypoint_penalty(&source, &modes, &b, &ident, 1.0, &t, 1e-4);
+        assert!(
+            p_tiny.is_finite() && p_tiny > 0.0,
+            "tiny-variance penalty {p_tiny}"
+        );
+    }
+
+    #[test]
+    fn landmark_sigma_pose_is_scale_equivariant() {
+        // Scaling coords by `c` and the landmark std by `c` must recover the
+        // identical rotation and coefficients, with translation scaling by `c`.
+        let (source, modes, ev) = model();
+        let r = axis_angle([0.2, -0.3, 0.9], 0.7);
+        let t = [0.4_f64, -0.25, 0.15];
+        let target = DMatrix::from_fn(30, 3, |i, j| {
+            (0..3).map(|q| source[(i, q)] * r[(q, j)]).sum::<f64>() + t[j]
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [0usize, 8, 17, 25]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+        let mut cfg = config(landmarks.clone(), 0.0);
+        cfg.landmark_sigma = Some(0.03);
+        cfg.refine_landmark_sigma = Some(0.03);
+        let unit = cfg.initialize(&source, &target, &modes, &ev).unwrap();
+
+        let c = 3.0_f64;
+        let source_c = source.map(|v| v * c);
+        let modes_c = modes.map(|v| v * c);
+        let target_c = target.map(|v| v * c);
+        let landmarks_c: Vec<(usize, Vec<f64>)> = landmarks
+            .iter()
+            .map(|(i, q)| (*i, q.iter().map(|v| v * c).collect()))
+            .collect();
+        let mut cfg_c = config(landmarks_c, 0.0);
+        cfg_c.landmark_sigma = Some(0.03 * c);
+        cfg_c.refine_landmark_sigma = Some(0.03 * c);
+        let scaled = cfg_c
+            .initialize(&source_c, &target_c, &modes_c, &ev)
+            .unwrap();
+
+        assert!(
+            (&unit.rotation - &scaled.rotation).amax() < 1e-6,
+            "rotation not scale-equivariant"
+        );
+        for (a, b) in unit.coefficients.iter().zip(&scaled.coefficients) {
+            assert!((a - b).abs() < 1e-5, "coeff {a} vs {b}");
+        }
+        for (a, b) in unit.translation.iter().zip(&scaled.translation) {
+            assert!((a * c - b).abs() < 1e-5 * c, "t {a}*c vs {b}");
+        }
+    }
+
+    #[test]
+    fn fixed_variance_recovers_basin_that_blind_search_misses() {
+        // A shape-divergent, rotated target where the blind (surface-only) pose
+        // search lands in the WRONG rotation basin. Fixed-variance keypoint
+        // scoring steers the search to the correct basin. This is the
+        // discriminative version of the recovery test: it asserts the blind
+        // baseline actually fails, not merely that keypoints succeed.
+        let (source, modes, ev) = model();
+        let r = axis_angle([0.15, 0.25, 0.96], 2.5);
+        let t = [0.5_f64, -0.3, 0.2];
+        let bcoef = 4.0_f64;
+        // Deformed shape (mean + modes·b), then rotated + translated.
+        let shape = DMatrix::from_fn(30, 3, |i, j| source[(i, j)] + modes[(i * 3 + j, 0)] * bcoef);
+        let target = DMatrix::from_fn(30, 3, |i, j| {
+            (0..3).map(|q| shape[(i, q)] * r[(q, j)]).sum::<f64>() + t[j]
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [0usize, 8, 17, 25]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+
+        let blind = config(Vec::new(), 0.0)
+            .initialize(&source, &target, &modes, &ev)
+            .unwrap();
+        let blind_err = rotation_error_deg(&blind.rotation, &r);
+
+        let mut cfg = config(landmarks.clone(), 0.0);
+        cfg.landmark_sigma = Some(0.02);
+        cfg.refine_landmark_sigma = Some(0.02);
+        let guided = cfg.initialize(&source, &target, &modes, &ev).unwrap();
+        let guided_err = rotation_error_deg(&guided.rotation, &r);
+
+        assert!(
+            blind_err > 20.0,
+            "blind search should miss the basin, got {blind_err}°"
+        );
+        assert!(
+            guided_err < 8.0,
+            "fixed-variance search should recover the basin, got {guided_err}°"
+        );
     }
 }

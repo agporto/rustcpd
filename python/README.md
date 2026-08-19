@@ -38,6 +38,48 @@ posed = result.scale * (mean @ result.rotation) + result.translation
 
 # Global pose search for atlas initialization (3-D).
 init = cpd.pose_initialize(source, target, modes, eigenvalues)
+
+# If source and modes were pre-scaled from a physical-size estimate (for
+# example, a target-completeness prior), keep residual scale fixed while
+# Pose-EM continues to optimize rotation and translation.
+fragment_init = cpd.pose_initialize(
+    prescaled_source, fragment, prescaled_modes, eigenvalues, with_scale=False,
+)
+
+# A few corresponding keypoints (same locations on the model and the fragment)
+# steer the global pose search toward the keypoint-consistent basin, then keep
+# those vertices anchored while register_atlas optimizes shape + pose. Helpful
+# for fragments whose shape diverges from the mean. Both accept
+# landmark_indices (source-vertex indices) + landmark_targets (their observed
+# coordinates); off by default. Set the strength with landmark_sigma (a
+# physical localization std, preferred) or the heuristic landmark_weight.
+guided = cpd.pose_initialize(
+    source, fragment, modes, eigenvalues, with_scale=False,
+    # Fixed keypoint std τ (here the localization noise ~ 0.02·radius; squared
+    # to a variance τ² internally) for both the basin scoring and the refinement
+    # anchoring — the principled form, matching register_atlas(landmark_sigma=...)
+    # below, so the whole pipeline uses one physical τ. (landmark_weight /
+    # refine_landmark_weight remain as heuristic fallbacks.)
+    landmark_indices=kp_idx, landmark_targets=kp_xyz,
+    landmark_sigma=0.02 * radius, refine_landmark_sigma=0.02 * radius,
+)
+fit = cpd.register_atlas(
+    fragment, source, modes, eigenvalues, with_scale=False,
+    initial_rotation=guided.rotation, initial_translation=guided.translation,
+    # Prefer landmark_sigma (an explicit localization std τ, here the keypoint
+    # noise ~ 0.02·radius, squared internally) over the heuristic landmark_weight:
+    # it gives a fixed constraint strength and keeps fit.sigma2 a clean surface
+    # residual. fit.landmark_rms reports the landmark fit separately.
+    landmark_indices=kp_idx, landmark_targets=kp_xyz, landmark_sigma=0.02 * radius,
+)
+
+# The fit's residual variance is a strong failure signal: a wrong pose basin
+# cannot fit the fragment. Calibrate sigma2 -> P(correct) on a few labelled
+# fits (recalibrate per dataset), then flag low-confidence fragments.
+from rustcpd import calibration
+cal = calibration.PoseConfidenceCalibrator.fit(sigma2_array, correct_array)
+if not cal.trust(fit.sigma2):
+    ...  # low confidence: review or collect more keypoints
 ```
 
 After a **deformable** fit, apply the learned continuous warp to points it

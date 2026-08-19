@@ -263,6 +263,14 @@ pub struct AtlasResult {
     /// Final convergence-criterion value.
     #[pyo3(get)]
     pub difference: f64,
+    /// Pointwise RMS of the anchored-landmark residuals `sqrt(sum||r_l||^2 / K)`
+    /// (original target frame); NaN when no landmarks were supplied. Under
+    /// isotropic per-coordinate noise `tau` its noise floor is `sqrt(D)*tau`
+    /// (`sqrt(3)*tau` in 3D), not `tau`; for a scale-free check form the reduced
+    /// chi-square `(landmark_rms / (sqrt(D)*tau))**2`, which is ~1 at the noise
+    /// floor.
+    #[pyo3(get)]
+    pub landmark_rms: f64,
     // Retained in native form for reconstruct / apply_similarity.
     coefficients_vec: Vec<f64>,
     rotation_matrix: DMatrix<f64>,
@@ -451,6 +459,7 @@ impl AtlasResult {
             iterations: self.iterations,
             difference: self.difference,
             negative_log_likelihood: f64::INFINITY,
+            landmark_rms: f64::NAN,
         }
     }
 }
@@ -471,9 +480,14 @@ pub struct PoseInitialization {
     #[pyo3(get)]
     pub translation: Py<PyArray1<f64>>,
     /// Negative-log-posterior score of the winner (lower is better).
+    /// Unnormalized: it only ranks hypotheses *within a single run* (and
+    /// includes the keypoint penalty when landmarks are set). Not comparable
+    /// across runs, across a different keypoint count, or a different
+    /// `landmark_sigma` / `landmark_weight`. For a cross-fit confidence signal
+    /// use the atlas `sigma2` with `calibration.PoseConfidenceCalibrator`.
     #[pyo3(get)]
     pub score: f64,
-    /// Score gap to the runner-up hypothesis.
+    /// Score gap to the runner-up hypothesis. Same within-run caveat as `score`.
     #[pyo3(get)]
     pub score_margin: f64,
     /// Shannon entropy of the refined-hypothesis posterior.
@@ -799,6 +813,8 @@ fn register_deformable(
     kdtree_radius_scale = None,
     initial_coefficients = None, initial_rotation = None,
     initial_scale = 1.0, initial_translation = None, sigma2 = None,
+    landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
+    landmark_sigma = None,
     max_iterations = 100, tolerance = 1e-3, outlier_weight = 0.0,
     k = None, parallel = true, single_precision = false))]
 #[allow(clippy::too_many_arguments)]
@@ -818,6 +834,10 @@ fn register_atlas(
     initial_scale: f64,
     initial_translation: Option<Vec<f64>>,
     sigma2: Option<f64>,
+    landmark_indices: Option<Vec<usize>>,
+    landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
+    landmark_weight: f64,
+    landmark_sigma: Option<f64>,
     max_iterations: usize,
     tolerance: f64,
     outlier_weight: f64,
@@ -828,6 +848,27 @@ fn register_atlas(
     let x = matrix_from(target.as_array());
     let mean = matrix_from(mean.as_array());
     let modes = matrix_from(modes.as_array());
+    let landmarks: Vec<(usize, Vec<f64>)> = match (landmark_indices, landmark_targets.as_ref()) {
+        (Some(indices), Some(points)) => {
+            let pts = matrix_from(points.as_array());
+            if indices.len() != pts.nrows() {
+                return Err(PyValueError::new_err(
+                    "landmark_indices and landmark_targets must have matching lengths",
+                ));
+            }
+            indices
+                .into_iter()
+                .enumerate()
+                .map(|(row, index)| (index, (0..pts.ncols()).map(|j| pts[(row, j)]).collect()))
+                .collect()
+        }
+        (None, None) => Vec::new(),
+        _ => {
+            return Err(PyValueError::new_err(
+                "landmark_indices and landmark_targets must be provided together",
+            ));
+        }
+    };
     let config = cpd::AtlasConfig {
         em: em_config(
             sigma2,
@@ -848,6 +889,9 @@ fn register_atlas(
         initial_rotation: initial_rotation.as_ref().map(|r| matrix_from(r.as_array())),
         initial_scale,
         initial_translation,
+        landmarks,
+        landmark_weight,
+        landmark_sigma,
     };
     let result = py
         .detach(|| cpd::AtlasRegistration::new(&x, &mean, &modes, config)?.register())
@@ -861,6 +905,7 @@ fn register_atlas(
         sigma2: result.sigma2,
         iterations: result.iterations,
         difference: result.difference,
+        landmark_rms: result.landmark_rms,
         coefficients_vec: result.coefficients,
         rotation_matrix: result.rotation,
         translation_vec: result.translation,
@@ -870,6 +915,10 @@ fn register_atlas(
 /// Pose-marginalized initialization: sweeps a rotation lattice and
 /// returns the best-scoring similarity transform and shape coefficients
 /// for starting a full atlas registration (3-D only).
+///
+/// Set `with_scale=False` when `source` and `modes` were already pre-scaled
+/// from an external physical-size estimate. Rotation and translation remain
+/// optimized, while the residual isotropic scale is fixed at 1.0.
 #[pyfunction]
 #[pyo3(signature = (source, target, modes, eigenvalues, *,
     rotation_count = 193, coarse_source_count = 400,
@@ -879,7 +928,12 @@ fn register_atlas(
     refine_count = 12, refine_source_count = None,
     refine_target_count = 1600, refine_iterations = 30,
     lambda_regularization = 0.1, outlier_weight = 0.05,
-    identity_prior_probability = 0.2, seed = 0, parallel = true,
+    identity_prior_probability = 0.2,
+    landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
+    landmark_sigma = None,
+    refine_landmark_weight = 0.0, refine_landmark_sigma = None,
+    with_scale = true,
+    seed = 0, parallel = true,
     single_precision = false))]
 #[allow(clippy::too_many_arguments)]
 fn pose_initialize(
@@ -903,6 +957,13 @@ fn pose_initialize(
     lambda_regularization: f64,
     outlier_weight: f64,
     identity_prior_probability: f64,
+    landmark_indices: Option<Vec<usize>>,
+    landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
+    landmark_weight: f64,
+    landmark_sigma: Option<f64>,
+    refine_landmark_weight: f64,
+    refine_landmark_sigma: Option<f64>,
+    with_scale: bool,
     seed: u64,
     parallel: bool,
     single_precision: bool,
@@ -910,6 +971,27 @@ fn pose_initialize(
     let source = matrix_from(source.as_array());
     let target = matrix_from(target.as_array());
     let modes = matrix_from(modes.as_array());
+    let landmarks: Vec<(usize, Vec<f64>)> = match (landmark_indices, landmark_targets.as_ref()) {
+        (Some(indices), Some(points)) => {
+            let pts = matrix_from(points.as_array());
+            if indices.len() != pts.nrows() {
+                return Err(PyValueError::new_err(
+                    "landmark_indices and landmark_targets must have matching lengths",
+                ));
+            }
+            indices
+                .into_iter()
+                .enumerate()
+                .map(|(row, index)| (index, (0..pts.ncols()).map(|j| pts[(row, j)]).collect()))
+                .collect()
+        }
+        (None, None) => Vec::new(),
+        _ => {
+            return Err(PyValueError::new_err(
+                "landmark_indices and landmark_targets must be provided together",
+            ));
+        }
+    };
     let coarse_score_mode = match coarse_score_mode.as_str() {
         "trajectory" => cpd::PoseScoreMode::Trajectory,
         "final" => cpd::PoseScoreMode::Final,
@@ -935,6 +1017,12 @@ fn pose_initialize(
         lambda_regularization,
         outlier_weight,
         identity_prior_probability,
+        landmarks,
+        landmark_weight,
+        landmark_sigma,
+        refine_landmark_weight,
+        refine_landmark_sigma,
+        with_scale,
         seed,
         parallel,
         single_precision,

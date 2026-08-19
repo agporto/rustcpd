@@ -137,6 +137,115 @@ def coverage_curve(
     return curve
 
 
+def failure_detection_auc(
+    sigma2: NDArray[np.float64], correct: NDArray[np.bool_]
+) -> float:
+    """AUC for using a low atlas residual ``sigma2`` to predict a correct fit.
+
+    ``correct`` is a boolean/0-1 label per fit (e.g. pose within tolerance).
+    Returns the rank-based (Mann-Whitney) area under the ROC of the score
+    ``-log(sigma2)``; 0.5 is chance, 1.0 is perfect separation. Use it to check
+    that ``sigma2`` actually discriminates failures on *your* data before
+    trusting a calibrated probability.
+    """
+    sigma2 = np.asarray(sigma2, dtype=np.float64).ravel()
+    y = np.asarray(correct).ravel().astype(bool)
+    if sigma2.shape != y.shape:
+        raise ValueError("sigma2 and correct must have the same shape")
+    if y.all() or not y.any():
+        raise ValueError("need both correct and failed examples")
+    score = -np.log(np.maximum(sigma2, _TINY))
+    order = np.argsort(score, kind="mergesort")
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, score.size + 1)
+    # average ranks for ties so the statistic is exact under ties
+    _, inv, counts = np.unique(score, return_inverse=True, return_counts=True)
+    csum = np.cumsum(counts)
+    avg = (csum - (counts - 1) / 2.0)
+    ranks = avg[inv]
+    n_pos = int(y.sum()); n_neg = int((~y).sum())
+    return float((ranks[y].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
+@dataclass(frozen=True)
+class PoseConfidenceCalibrator:
+    """Maps an atlas fit's residual variance ``sigma2`` to ``P(pose correct)``.
+
+    A wrong pose basin cannot fit the fragment, so it leaves a large residual
+    variance; ``AtlasResult.sigma2`` is therefore a strong, *unsupervised*
+    failure signal (empirically near-perfect separation on synthetic SSM
+    fragments). This calibrator turns that monotone signal into a probability
+    with one-dimensional logistic regression on ``log(sigma2)``, fit on a set of
+    completed fragments you have labelled correct/failed.
+
+    ``sigma2`` is in squared target-coordinate units, so the fit is **dataset
+    specific**: always recalibrate on your own data and coordinate frame rather
+    than reusing coefficients across problems. Check
+    :func:`failure_detection_auc` first to confirm ``sigma2`` discriminates at
+    all on your data.
+
+    Example::
+
+        cal = PoseConfidenceCalibrator.fit(sigma2_array, correct_array)
+        p = cal.probability(new_fit.sigma2)     # P(pose correct)
+        if not cal.trust(new_fit.sigma2):       # flag for more keypoints
+            ...
+    """
+
+    intercept: float
+    slope: float  # coefficient on log(sigma2); negative (low sigma2 -> confident)
+
+    @classmethod
+    def fit(
+        cls,
+        sigma2: NDArray[np.float64],
+        correct: NDArray[np.bool_],
+        *,
+        max_iter: int = 100,
+        tol: float = 1e-10,
+    ) -> "PoseConfidenceCalibrator":
+        """Fit ``P(correct) = sigmoid(intercept + slope * log(sigma2))`` by IRLS."""
+        sigma2 = np.asarray(sigma2, dtype=np.float64).ravel()
+        y = np.asarray(correct).ravel().astype(np.float64)
+        if sigma2.shape != y.shape:
+            raise ValueError("sigma2 and correct must have the same shape")
+        if sigma2.size == 0:
+            raise ValueError("need at least one example")
+        if np.any(sigma2 <= 0):
+            raise ValueError("sigma2 must be positive")
+        if y.min() == y.max():
+            raise ValueError("need both correct and failed examples to fit")
+        x = np.log(sigma2)
+        design = np.column_stack([np.ones_like(x), x])
+        w = np.zeros(2)
+        for _ in range(max_iter):
+            p = 1.0 / (1.0 + np.exp(-(design @ w)))
+            grad = design.T @ (p - y)
+            weights = np.maximum(p * (1.0 - p), _TINY)
+            hess = (design * weights[:, None]).T @ design
+            step = np.linalg.solve(hess + 1e-9 * np.eye(2), grad)
+            w = w - step
+            if np.max(np.abs(step)) < tol:
+                break
+        return cls(intercept=float(w[0]), slope=float(w[1]))
+
+    def probability(self, sigma2: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Calibrated ``P(pose correct)`` for one or more ``sigma2`` values."""
+        s = np.asarray(sigma2, dtype=np.float64)
+        x = np.log(np.maximum(s, _TINY))
+        return 1.0 / (1.0 + np.exp(-(self.intercept + self.slope * x)))
+
+    def trust(
+        self, sigma2: NDArray[np.float64], threshold: float = 0.5
+    ) -> NDArray[np.bool_]:
+        """Boolean: is the fit's calibrated confidence at least ``threshold``?
+
+        Fragments where this is ``False`` are the ones to flag for review or for
+        collecting additional keypoints.
+        """
+        return self.probability(sigma2) >= threshold
+
+
 def calibrate_completion(
     examples: Iterable[object],
     complete: Callable[[object], tuple[NDArray[np.float64], NDArray[np.float64]]],

@@ -53,6 +53,25 @@ statistical-shape-model/atlas, and pose-marginalized point-set registration.
 Every returned rotation uses the same row-vector convention:
 `transformed = scale · points · rotation + translation`.
 
+`PoseMarginalizedConfig::with_scale = false` fixes the residual pose scale at
+1.0 while continuing to optimize rotation and translation. This is intended
+for fragment workflows that pre-scale the source shape and modes from an
+external physical-size estimate before pose initialization.
+
+A handful of corresponding keypoints — the same anatomical locations marked on
+the model and on the target — sharpen fragment fits that diverge in shape from
+the mean. Set `AtlasConfig::landmarks` (source-vertex index paired with its
+target coordinate) and a landmark strength to keep those vertices anchored as a
+soft data term through every EM iteration, and set
+`PoseMarginalizedConfig::landmarks` (plus a strength) to let the same
+correspondences steer the global rotation search toward the keypoint-consistent
+basin. Prefer `landmark_sigma` (a physical keypoint-localization standard
+deviation `τ`, squared to a variance internally) over the heuristic
+`landmark_weight`; when both are set, `landmark_sigma` takes precedence. Both
+terms are off by default (empty `landmarks`, no strength).
+Three non-collinear keypoints are enough to resolve the rotation basin; the
+partial mesh does the rest.
+
 `EmConfig::k = None` selects the dense E-step. `Some(k)` selects a
 source-to-target k-nearest-neighbor approximation.
 

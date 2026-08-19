@@ -51,6 +51,10 @@ class AtlasResult:
     sigma2: float
     iterations: int
     difference: float
+    # Pointwise RMS of landmark residuals sqrt(sum||r||^2/K); NaN with no
+    # landmarks. Noise floor is sqrt(D)*tau (sqrt(3)*tau in 3D); normalized
+    # discrepancy (landmark_rms/(sqrt(D)*tau))**2 is ~1 at the noise floor.
+    landmark_rms: float
     def reconstruct(
         self, mean: _ArrayLike, modes: _ArrayLike
     ) -> NDArray[np.float64]: ...
@@ -74,6 +78,11 @@ class PoseInitialization:
     rotation: NDArray[np.float64]
     scale: float
     translation: NDArray[np.float64]
+    # Unnormalized negative-log-posterior of the winner: ranks hypotheses only
+    # within a single run (includes the keypoint penalty when landmarks are set).
+    # Not comparable across runs, keypoint counts, or landmark_sigma values. Use
+    # the atlas sigma2 with calibration.PoseConfidenceCalibrator for cross-fit
+    # confidence.
     score: float
     score_margin: float
     posterior_entropy: float
@@ -188,6 +197,10 @@ def register_atlas(
     initial_scale: float = ...,
     initial_translation: Sequence[float] | None = ...,
     sigma2: float | None = ...,
+    landmark_indices: Sequence[int] | None = ...,
+    landmark_targets: _ArrayLike | None = ...,
+    landmark_weight: float = ...,
+    landmark_sigma: float | None = ...,
     max_iterations: int = ...,
     tolerance: float = ...,
     outlier_weight: float = ...,
@@ -216,6 +229,13 @@ def pose_initialize(
     lambda_regularization: float = ...,
     outlier_weight: float = ...,
     identity_prior_probability: float = ...,
+    landmark_indices: Sequence[int] | None = ...,
+    landmark_targets: _ArrayLike | None = ...,
+    landmark_weight: float = ...,
+    landmark_sigma: float | None = ...,
+    refine_landmark_weight: float = ...,
+    refine_landmark_sigma: float | None = ...,
+    with_scale: bool = ...,
     seed: int = ...,
     parallel: bool = ...,
     single_precision: bool = ...,

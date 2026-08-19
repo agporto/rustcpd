@@ -48,6 +48,7 @@ fn atlas_similarity_uses_direct_row_vector_rotation() {
         iterations: 0,
         difference: 0.0,
         negative_log_likelihood: 0.0,
+        landmark_rms: f64::NAN,
     };
     let transformed = result.apply_similarity(&source).unwrap();
     let expected = DMatrix::from_fn(source.nrows(), 3, |i, j| {

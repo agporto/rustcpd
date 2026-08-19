@@ -39,6 +39,44 @@ pub struct AtlasConfig {
     pub initial_scale: f64,
     /// Starting translation (defaults to zero).
     pub initial_translation: Option<Vec<f64>>,
+    /// Anchored keypoint correspondences: each entry pairs a source-model
+    /// vertex index with its known target coordinate (in the original target
+    /// frame). Unlike [`Self::initial_rotation`] these persist through every
+    /// EM iteration as a soft data term, keeping the fit in the correct basin
+    /// while shape and pose are optimized. Empty (default) disables the term.
+    pub landmarks: Vec<(usize, Vec<f64>)>,
+    /// Gain on the landmark term, expressed as a multiple of the average
+    /// per-source posterior mass. Each landmark contributes
+    /// `landmark_weight · (Np / M)` of correspondence mass, so its influence
+    /// tracks the annealing level rather than being swamped as `sigma2`
+    /// shrinks. `0` disables the term even when `landmarks` is non-empty.
+    ///
+    /// This is a heuristic scaling: the effective landmark variance is
+    /// `sigma2 / mass`, so it *shrinks* with the surface fit, the constraint
+    /// strength drifts with posterior occupancy / outlier weight, and the
+    /// landmark residuals leak into [`AtlasResult::sigma2`]. Prefer
+    /// [`Self::landmark_sigma`] for a principled, annealing-independent
+    /// formulation with a clean surface-residual `sigma2`.
+    pub landmark_weight: f64,
+    /// Landmark localization standard deviation `τ` (a distance in
+    /// target-coordinate units), the principled alternative to
+    /// [`Self::landmark_weight`]. When `Some`, it is squared internally to a
+    /// variance `τ²` and each landmark is folded in with mass `a = sigma2 / τ²`,
+    /// giving a *fixed* effective landmark variance independent of annealing —
+    /// exactly the `DeformableConfig::constraint_error` scheme. Surface `sigma2`
+    /// is then estimated from the ordinary CPD correspondences only, so
+    /// [`AtlasResult::sigma2`] stays a clean surface-residual variance. Landmark
+    /// mass no longer *directly* contaminates the surface variance or, through
+    /// it, weakens the prior; the prior can still adapt *indirectly* when the
+    /// constrained solution genuinely lowers the surface residual (the prior
+    /// coefficient is `γ = λ·sigma2/scale²`, so a smaller `sigma2` does relax
+    /// it — that is the intended adaptive annealing, not the contamination this
+    /// mode removes). Choose `τ` to
+    /// reflect not only annotation noise but also the model-truncation /
+    /// landmark-representation error, or the anchors may overconstrain what the
+    /// truncated SSM cannot reproduce. Takes precedence over `landmark_weight`
+    /// when set. `None` (default) keeps the heuristic weight behavior.
+    pub landmark_sigma: Option<f64>,
 }
 
 impl Default for AtlasConfig {
@@ -55,6 +93,9 @@ impl Default for AtlasConfig {
             initial_rotation: None,
             initial_scale: 1.0,
             initial_translation: None,
+            landmarks: Vec::new(),
+            landmark_weight: 0.0,
+            landmark_sigma: None,
         }
     }
 }
@@ -81,6 +122,20 @@ pub struct AtlasResult {
     /// Negative log-likelihood of the mixture at the final E-step (the
     /// "trajectory" data objective). `f64::INFINITY` if no EM step ran.
     pub negative_log_likelihood: f64,
+    /// RMS of the anchored-landmark residuals `‖similarity(mean+modes·b)ᵢ − qᵢ‖`
+    /// at the final iteration, in the original target frame — a *pointwise* RMS,
+    /// `sqrt(Σₗ‖rₗ‖² / K)`. `f64::NAN` when no landmarks were supplied. Reported
+    /// separately from [`Self::sigma2`] so the surface-fit variance and the
+    /// landmark fit can be read independently.
+    ///
+    /// Because each residual is a `D`-vector, under isotropic per-coordinate
+    /// localization noise `τ` its expected noise-floor magnitude is `√D · τ`
+    /// (`√3 · τ` in 3D), not `τ`. For a scale-free "is the landmark fit within
+    /// noise?" check, form the normalized discrepancy
+    /// `(landmark_rms / (√D · τ))²` (equivalently the reduced
+    /// `χ² = Σₗ‖rₗ‖² / (D·K·τ²)`), which is ≈ 1 when the residuals are just
+    /// localization noise and ≫ 1 when the anchors are fighting the fit.
+    pub landmark_rms: f64,
 }
 
 impl AtlasResult {
@@ -214,6 +269,23 @@ impl<'a> AtlasRegistration<'a> {
         if config.with_scale && (!config.initial_scale.is_finite() || config.initial_scale <= 0.0) {
             return Err(Error::PositiveParameter("initial_scale"));
         }
+        if !config.landmark_weight.is_finite() || config.landmark_weight < 0.0 {
+            return Err(Error::PositiveParameter("landmark_weight"));
+        }
+        if config
+            .landmark_sigma
+            .is_some_and(|t2| !t2.is_finite() || t2 <= 0.0)
+        {
+            return Err(Error::PositiveParameter("landmark_sigma"));
+        }
+        for (index, point) in &config.landmarks {
+            if *index >= mean.nrows() {
+                return Err(Error::InvalidShape("landmarks"));
+            }
+            if point.len() != d || !point.iter().all(|value| value.is_finite()) {
+                return Err(Error::InvalidShape("landmarks"));
+            }
+        }
         if config
             .initial_rotation
             .as_ref()
@@ -303,6 +375,53 @@ impl<'a> AtlasRegistration<'a> {
             })
             .sum();
         let variance_floor = (1e-6 * extent2 / d as f64).max(variance_floor(&x, d));
+        // Anchored-keypoint term is enabled by either a positive heuristic
+        // weight or an explicit landmark localization std. The std is squared
+        // to a variance here (and mapped into the working frame when
+        // normalizing, where a std scales by `1/target_scale`).
+        let landmark_var_work = self.config.landmark_sigma.map(|sigma| {
+            let sigma = if self.config.normalize {
+                sigma / target_scale
+            } else {
+                sigma
+            };
+            sigma * sigma
+        });
+        let landmarks_active = self.config.landmark_weight > 0.0 || landmark_var_work.is_some();
+        // Landmark target coordinates mapped into the working frame.
+        let landmarks_work: Vec<(usize, Vec<f64>)> = if landmarks_active {
+            self.config
+                .landmarks
+                .iter()
+                .map(|(index, point)| {
+                    let mapped = if self.config.normalize {
+                        (0..d)
+                            .map(|j| (point[j] - centroid[j]) / target_scale)
+                            .collect()
+                    } else {
+                        point.clone()
+                    };
+                    (*index, mapped)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut landmark_rms = f64::NAN;
+        // Landmark rows are constant across EM iterations. Precompute a mask and
+        // the unique row list once so the principled variance update can read the
+        // surface (pre-augmentation) p1/px at those rows directly — avoiding the
+        // catastrophic cancellation that subtracting a huge augmented landmark
+        // term back out would incur for a tight `τ` (large mass) or large-scale
+        // coordinates.
+        let is_landmark_row = {
+            let mut mask = vec![false; m];
+            for (index, _) in &landmarks_work {
+                mask[*index] = true;
+            }
+            mask
+        };
+        let unique_landmark_rows: Vec<usize> = (0..m).filter(|&i| is_landmark_row[i]).collect();
         let mut diff = f64::INFINITY;
         let mut iterations = 0;
         let mut last_nll = f64::INFINITY;
@@ -338,11 +457,50 @@ impl<'a> AtlasRegistration<'a> {
             } else {
                 (&dense_em, None)
             };
-            let stats = posterior_stats(&x, &ty, sigma2, em, false, active_index);
+            let mut stats = posterior_stats(&x, &ty, sigma2, em, false, active_index);
             if stats.np <= f64::MIN_POSITIVE {
                 return Err(Error::SingularSystem);
             }
             last_nll = stats.negative_log_likelihood;
+            // Anchored-keypoint term: fold each landmark into the sufficient
+            // statistics as a virtual correspondence between source vertex
+            // `index` and its known target point `q`. It then flows into both
+            // M-steps — the coefficient solve (via the per-source target
+            // estimate `px/p1`) and the weighted-similarity solve — with no
+            // separate solver.
+            //
+            // Mass `a` sets the effective landmark variance `sigma2 / a`:
+            //   * `landmark_sigma = Some(τ)`  →  `a = sigma2 / τ²`  (fixed
+            //     variance `τ²`, independent of annealing; the principled mode).
+            //   * else                        →  `a = weight · Np / M`  (the
+            //     heuristic, occupancy-scaled mode).
+            // `np_surface` is the pre-augmentation posterior mass; it and the
+            // landmark contributions below let the variance update stay
+            // surface-only in the principled mode.
+            let np_surface = stats.np;
+            let landmark_mass = if landmarks_work.is_empty() {
+                0.0
+            } else {
+                match landmark_var_work {
+                    Some(t2) => sigma2 / t2.max(f64::MIN_POSITIVE),
+                    None => self.config.landmark_weight * np_surface / m as f64,
+                }
+            };
+            // Surface (pre-augmentation) p1/px at the unique landmark rows,
+            // captured BEFORE the augmentation below so the principled variance
+            // update can use them directly instead of subtracting the huge
+            // augmented landmark term back out.
+            let landmark_surface: Vec<(f64, Vec<f64>)> = unique_landmark_rows
+                .iter()
+                .map(|&i| (stats.p1[i], (0..d).map(|j| stats.px[(i, j)]).collect()))
+                .collect();
+            for (index, q) in &landmarks_work {
+                for (j, value) in q.iter().enumerate() {
+                    stats.px[(*index, j)] += landmark_mass * value;
+                }
+                stats.p1[*index] += landmark_mass;
+                stats.np += landmark_mass;
+            }
             // residual = model-frame target estimate minus the mean shape,
             // written straight into the (M·D)×1 right-hand side buffer.
             for i in 0..m {
@@ -397,16 +555,67 @@ impl<'a> AtlasRegistration<'a> {
                 / rank as f64;
             previous_coefficients.copy_from_slice(&coefficients);
             let previous_sigma = sigma2;
-            let xpx: f64 = (0..x.nrows())
+            // `xpx` uses the target-side posterior mass `pt1`, which the landmark
+            // augmentation never touches, so it is already surface-clean.
+            let xpx_surface: f64 = (0..x.nrows())
                 .map(|i| stats.pt1[i] * (0..d).map(|j| x[(i, j)].powi(2)).sum::<f64>())
                 .sum();
-            let ypy: f64 = (0..m)
-                .map(|i| stats.p1[i] * (0..d).map(|j| ty[(i, j)].powi(2)).sum::<f64>())
+            // Raw landmark residual for reporting (no cancellation involved).
+            let lm_resid2: f64 = landmarks_work
+                .iter()
+                .map(|(index, q)| {
+                    (0..d)
+                        .map(|j| (ty[(*index, j)] - q[j]).powi(2))
+                        .sum::<f64>()
+                })
                 .sum();
-            let cross: f64 = (0..m)
-                .map(|i| (0..d).map(|j| ty[(i, j)] * stats.px[(i, j)]).sum::<f64>())
-                .sum();
-            sigma2 = ((xpx - 2.0 * cross + ypy) / (stats.np * d as f64)).max(variance_floor);
+            let (xpx, ypy, cross, denom) = if landmark_var_work.is_some() {
+                // Principled (`landmark_sigma`) mode: estimate `sigma2` from the
+                // surface correspondences ONLY. Sum the surface p1/px directly —
+                // using the saved pre-augmentation values at the landmark rows and
+                // NEVER forming the large augmented landmark term — so a tight `τ`
+                // (huge mass) cannot swamp the surface signal by cancellation.
+                let mut ypy_surface = 0.0;
+                let mut cross_surface = 0.0;
+                for i in 0..m {
+                    if is_landmark_row[i] {
+                        continue;
+                    }
+                    ypy_surface += stats.p1[i] * (0..d).map(|j| ty[(i, j)].powi(2)).sum::<f64>();
+                    cross_surface += (0..d).map(|j| ty[(i, j)] * stats.px[(i, j)]).sum::<f64>();
+                }
+                for (&index, (surf_p1, surf_px)) in
+                    unique_landmark_rows.iter().zip(&landmark_surface)
+                {
+                    ypy_surface += surf_p1 * (0..d).map(|j| ty[(index, j)].powi(2)).sum::<f64>();
+                    cross_surface += (0..d).map(|j| ty[(index, j)] * surf_px[j]).sum::<f64>();
+                }
+                (xpx_surface, ypy_surface, cross_surface, np_surface)
+            } else {
+                // Heuristic (`landmark_weight`) mode keeps the legacy behavior
+                // where landmarks enter the variance too. Here the AUGMENTED sums
+                // are exactly what we want, so there is no cancellation to avoid.
+                let ypy_aug: f64 = (0..m)
+                    .map(|i| stats.p1[i] * (0..d).map(|j| ty[(i, j)].powi(2)).sum::<f64>())
+                    .sum();
+                let cross_aug: f64 = (0..m)
+                    .map(|i| (0..d).map(|j| ty[(i, j)] * stats.px[(i, j)]).sum::<f64>())
+                    .sum();
+                let lm_xpx: f64 = landmarks_work
+                    .iter()
+                    .map(|(_, q)| landmark_mass * q.iter().map(|v| v * v).sum::<f64>())
+                    .sum();
+                (xpx_surface + lm_xpx, ypy_aug, cross_aug, stats.np)
+            };
+            sigma2 = ((xpx - 2.0 * cross + ypy) / (denom * d as f64)).max(variance_floor);
+            if !landmarks_work.is_empty() {
+                let rms = (lm_resid2 / landmarks_work.len() as f64).sqrt();
+                landmark_rms = if self.config.normalize {
+                    rms * target_scale
+                } else {
+                    rms
+                };
+            }
             diff = ((sigma2 - previous_sigma).abs() / (sigma2 + 1e-8)).max(bdiff);
             iterations += 1;
         }
@@ -444,6 +653,7 @@ impl<'a> AtlasRegistration<'a> {
             iterations,
             difference: diff,
             negative_log_likelihood: last_nll,
+            landmark_rms,
         })
     }
 }
@@ -562,4 +772,466 @@ fn weighted_similarity(
         .map(|j| mux[j] - scale * (0..d).map(|q| muy[q] * r[(q, j)]).sum::<f64>())
         .collect();
     Ok((r, scale, translation))
+}
+
+#[cfg(test)]
+mod landmark_tests {
+    use super::{AtlasConfig, AtlasRegistration};
+    use crate::EmConfig;
+    use nalgebra::DMatrix;
+
+    // Deterministic 8-point source and a rank-2 mode basis (point-major).
+    fn model() -> (DMatrix<f64>, DMatrix<f64>, Vec<f64>) {
+        let source = DMatrix::from_fn(8, 3, |i, j| {
+            let i = i as f64;
+            let j = j as f64;
+            (0.7 * i + 1.3 * j).sin() * 1.4 + 0.11 * i - 0.2 * j
+        });
+        let modes = DMatrix::from_fn(8 * 3, 2, |row, k| {
+            let row = row as f64;
+            let k = k as f64;
+            ((row + 1.0 + 5.0 * k) * 0.21).sin() * 0.5
+        });
+        (source, modes, vec![1.0, 1.0])
+    }
+
+    fn base_config() -> AtlasConfig {
+        AtlasConfig {
+            em: EmConfig {
+                // A short fixed budget: the Mahalanobis prior vanishes as
+                // sigma2 anneals to zero, so the regularization only bites
+                // before convergence. Six iterations keeps the plain fit
+                // under-shooting, giving the landmark term visible work to do.
+                max_iterations: 6,
+                tolerance: 0.0,
+                outlier_weight: 0.0,
+                ..Default::default()
+            },
+            eigenvalues: vec![1.0, 1.0],
+            // High regularization deliberately under-fits the shape, so the
+            // landmark data term has visible work to do.
+            lambda_regularization: 6.0,
+            normalize: false,
+            optimize_similarity: false,
+            with_scale: false,
+            ..Default::default()
+        }
+    }
+
+    fn landmark_residual(recon: &DMatrix<f64>, landmarks: &[(usize, Vec<f64>)]) -> f64 {
+        landmarks
+            .iter()
+            .map(|(i, q)| (0..3).map(|j| (recon[(*i, j)] - q[j]).powi(2)).sum::<f64>())
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    #[test]
+    fn landmarks_pull_anchored_vertices_toward_targets() {
+        let (source, modes, _) = model();
+        let truth = [0.9_f64, -0.7];
+        // Pure-shape target: source + modes·truth (identity pose).
+        let target = DMatrix::from_fn(8, 3, |i, j| {
+            source[(i, j)]
+                + (0..2)
+                    .map(|k| modes[(i * 3 + j, k)] * truth[k])
+                    .sum::<f64>()
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [1usize, 4, 6]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+
+        let plain = AtlasRegistration::new(&target, &source, &modes, base_config())
+            .unwrap()
+            .register()
+            .unwrap();
+        let anchored_cfg = AtlasConfig {
+            landmarks: landmarks.clone(),
+            landmark_weight: 40.0,
+            ..base_config()
+        };
+        let anchored = AtlasRegistration::new(&target, &source, &modes, anchored_cfg)
+            .unwrap()
+            .register()
+            .unwrap();
+
+        let plain_recon = plain.reconstruct(&source, &modes).unwrap();
+        let anchored_recon = anchored.reconstruct(&source, &modes).unwrap();
+        let plain_res = landmark_residual(&plain_recon, &landmarks);
+        let anchored_res = landmark_residual(&anchored_recon, &landmarks);
+
+        // The anchored fit places its landmark vertices much closer to their
+        // targets than the over-regularized plain fit, and does so by using
+        // more of the true coefficient (it stops under-fitting).
+        assert!(
+            anchored_res < 0.25 * plain_res,
+            "anchored {anchored_res} vs plain {plain_res}"
+        );
+        let plain_norm: f64 = plain.coefficients.iter().map(|c| c * c).sum();
+        let anchored_norm: f64 = anchored.coefficients.iter().map(|c| c * c).sum();
+        assert!(anchored_norm > plain_norm);
+    }
+
+    #[test]
+    fn zero_landmark_weight_is_a_noop() {
+        let (source, modes, _) = model();
+        let target = DMatrix::from_fn(8, 3, |i, j| source[(i, j)] + 0.05 * (i as f64 - j as f64));
+        let landmarks: Vec<(usize, Vec<f64>)> =
+            vec![(0, vec![0.0, 0.0, 0.0]), (5, vec![9.0, 9.0, 9.0])];
+        let without = AtlasRegistration::new(&target, &source, &modes, base_config())
+            .unwrap()
+            .register()
+            .unwrap();
+        // Landmarks present, but weight 0 must not perturb the result at all.
+        let disabled_cfg = AtlasConfig {
+            landmarks,
+            landmark_weight: 0.0,
+            ..base_config()
+        };
+        let disabled = AtlasRegistration::new(&target, &source, &modes, disabled_cfg)
+            .unwrap()
+            .register()
+            .unwrap();
+        for (a, b) in without.coefficients.iter().zip(&disabled.coefficients) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn atlas_rejects_invalid_landmarks() {
+        let (source, modes, _) = model();
+        let target = source.clone();
+        let bad_index = AtlasConfig {
+            landmarks: vec![(99, vec![0.0, 0.0, 0.0])],
+            landmark_weight: 1.0,
+            ..base_config()
+        };
+        assert!(AtlasRegistration::new(&target, &source, &modes, bad_index).is_err());
+        let bad_dim = AtlasConfig {
+            landmarks: vec![(0, vec![0.0, 0.0])],
+            landmark_weight: 1.0,
+            ..base_config()
+        };
+        assert!(AtlasRegistration::new(&target, &source, &modes, bad_dim).is_err());
+        let bad_weight = AtlasConfig {
+            landmarks: vec![(0, vec![0.0, 0.0, 0.0])],
+            landmark_weight: -1.0,
+            ..base_config()
+        };
+        assert!(AtlasRegistration::new(&target, &source, &modes, bad_weight).is_err());
+        let bad_error = AtlasConfig {
+            landmarks: vec![(0, vec![0.0, 0.0, 0.0])],
+            landmark_sigma: Some(-1.0),
+            ..base_config()
+        };
+        assert!(AtlasRegistration::new(&target, &source, &modes, bad_error).is_err());
+    }
+
+    #[test]
+    fn landmark_sigma_keeps_sigma2_surface_clean() {
+        let (source, modes, _) = model();
+        // Rigid target plus a small NON-model surface perturbation, so there is
+        // a real surface residual for sigma2 to measure.
+        let (c, s) = (0.2_f64.cos(), 0.2_f64.sin());
+        let rmat = DMatrix::from_row_slice(3, 3, &[c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0]);
+        let target = DMatrix::from_fn(8, 3, |i, j| {
+            (0..3).map(|q| source[(i, q)] * rmat[(q, j)]).sum::<f64>()
+                + 0.01 * ((i * 3 + j) as f64).sin()
+        });
+        let cfg = || AtlasConfig {
+            em: EmConfig {
+                max_iterations: 200,
+                tolerance: 1e-10,
+                outlier_weight: 0.0,
+                ..Default::default()
+            },
+            eigenvalues: vec![1.0, 1.0],
+            lambda_regularization: 0.5,
+            optimize_similarity: true,
+            with_scale: false,
+            ..Default::default()
+        };
+        let base = AtlasRegistration::new(&target, &source, &modes, cfg())
+            .unwrap()
+            .register()
+            .unwrap();
+        assert!(base.landmark_rms.is_nan());
+        // Landmarks placed exactly where the no-landmark fit put those vertices:
+        // consistent constraints must not move the surface fit.
+        let landmarks: Vec<(usize, Vec<f64>)> = [1usize, 4, 6]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| base.points[(i, j)]).collect()))
+            .collect();
+        let principled = AtlasRegistration::new(
+            &target,
+            &source,
+            &modes,
+            AtlasConfig {
+                landmarks: landmarks.clone(),
+                landmark_sigma: Some(1e-2),
+                ..cfg()
+            },
+        )
+        .unwrap()
+        .register()
+        .unwrap();
+        let heavy = AtlasRegistration::new(
+            &target,
+            &source,
+            &modes,
+            AtlasConfig {
+                landmarks,
+                landmark_weight: 200.0,
+                ..cfg()
+            },
+        )
+        .unwrap()
+        .register()
+        .unwrap();
+        // Consistent landmarks are already satisfied by both fits.
+        assert!(principled.landmark_rms < 0.02);
+        // Principled surface sigma2 is (essentially) unchanged by the anchors.
+        assert!(
+            (principled.sigma2 - base.sigma2).abs() < 0.1 * base.sigma2,
+            "principled {} vs base {}",
+            principled.sigma2,
+            base.sigma2
+        );
+        // Heuristic sigma2 is diluted by the added landmark mass in its
+        // denominator even though the landmark residual is ~0 — the
+        // contamination the principled mode removes.
+        assert!(
+            heavy.sigma2 < 0.5 * base.sigma2,
+            "heavy {} vs base {}",
+            heavy.sigma2,
+            base.sigma2
+        );
+    }
+
+    // A similarity-optimizing config used by the equivariance / precedence
+    // tests below (anneals to convergence so the fit is fully determined).
+    fn sim_config(sigma: Option<f64>, landmarks: Vec<(usize, Vec<f64>)>) -> AtlasConfig {
+        AtlasConfig {
+            em: EmConfig {
+                max_iterations: 300,
+                tolerance: 1e-12,
+                outlier_weight: 0.0,
+                ..Default::default()
+            },
+            eigenvalues: vec![1.0, 1.0],
+            lambda_regularization: 0.3,
+            normalize: false,
+            optimize_similarity: true,
+            with_scale: false,
+            landmarks,
+            landmark_sigma: sigma,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn landmark_sigma_is_scale_equivariant() {
+        // Scaling the whole problem by `c` and the landmark *std* by `c` must
+        // leave the recovered shape coefficients and rotation identical, with
+        // translation scaling by `c`, sigma2 by `c²`, and landmark_rms by `c`.
+        // This is the equivariance a standard-deviation parameter has to obey;
+        // a bare unit-free weight (mass `weight·Np/M`) would NOT reproduce it,
+        // which is the whole point of switching the API to `landmark_sigma`.
+        let (source, modes, _) = model();
+        let (cc, sc) = (0.3_f64.cos(), 0.3_f64.sin());
+        let rot = DMatrix::from_row_slice(3, 3, &[cc, -sc, 0.0, sc, cc, 0.0, 0.0, 0.0, 1.0]);
+        let truth = [0.6_f64, -0.4];
+        let shape = DMatrix::from_fn(8, 3, |i, j| {
+            source[(i, j)]
+                + (0..2)
+                    .map(|k| modes[(i * 3 + j, k)] * truth[k])
+                    .sum::<f64>()
+        });
+        // Rotated pure-shape target (row-vector convention y = shape · R).
+        let target = DMatrix::from_fn(8, 3, |i, j| {
+            (0..3).map(|q| shape[(i, q)] * rot[(q, j)]).sum::<f64>()
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [1usize, 4, 6]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+
+        let unit = AtlasRegistration::new(
+            &target,
+            &source,
+            &modes,
+            sim_config(Some(0.05), landmarks.clone()),
+        )
+        .unwrap()
+        .register()
+        .unwrap();
+
+        let c = 2.5_f64;
+        let source_c = source.map(|v| v * c);
+        let modes_c = modes.map(|v| v * c);
+        let target_c = target.map(|v| v * c);
+        let landmarks_c: Vec<(usize, Vec<f64>)> = landmarks
+            .iter()
+            .map(|(i, q)| (*i, q.iter().map(|v| v * c).collect()))
+            .collect();
+        let scaled = AtlasRegistration::new(
+            &target_c,
+            &source_c,
+            &modes_c,
+            sim_config(Some(0.05 * c), landmarks_c),
+        )
+        .unwrap()
+        .register()
+        .unwrap();
+
+        for (a, b) in unit.coefficients.iter().zip(&scaled.coefficients) {
+            assert!((a - b).abs() < 1e-6, "coeff {a} vs {b}");
+        }
+        assert!((&unit.rotation - &scaled.rotation).amax() < 1e-6);
+        for (a, b) in unit.translation.iter().zip(&scaled.translation) {
+            assert!((a * c - b).abs() < 1e-6 * c.max(1.0), "t {a}*c vs {b}");
+        }
+        let s2 = unit.sigma2 * c * c;
+        assert!((s2 - scaled.sigma2).abs() < 1e-6 * s2.max(1.0));
+        assert!((unit.landmark_rms * c - scaled.landmark_rms).abs() < 1e-6 * c.max(1.0));
+    }
+
+    #[test]
+    fn landmark_sigma_takes_precedence_over_weight() {
+        // Setting BOTH landmark_sigma and landmark_weight must behave exactly
+        // like landmark_sigma alone — the fixed-variance term wins and the
+        // heuristic weight is ignored (documented precedence, no silent blend).
+        let (source, modes, _) = model();
+        let truth = [0.7_f64, -0.5];
+        let target = DMatrix::from_fn(8, 3, |i, j| {
+            source[(i, j)]
+                + (0..2)
+                    .map(|k| modes[(i * 3 + j, k)] * truth[k])
+                    .sum::<f64>()
+        });
+        // Deliberately INCONSISTENT landmarks (offset), so the fixed-variance
+        // and heuristic-weight branches produce genuinely different fits and
+        // the precedence assertion is not vacuous.
+        let landmarks: Vec<(usize, Vec<f64>)> = [1usize, 4, 6]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)] + 0.05).collect()))
+            .collect();
+
+        let sigma_only = AtlasConfig {
+            landmarks: landmarks.clone(),
+            landmark_sigma: Some(0.02),
+            ..base_config()
+        };
+        let both = AtlasConfig {
+            landmarks: landmarks.clone(),
+            landmark_sigma: Some(0.02),
+            landmark_weight: 123.0,
+            ..base_config()
+        };
+        let weight_only = AtlasConfig {
+            landmarks,
+            landmark_weight: 123.0,
+            ..base_config()
+        };
+        let a = AtlasRegistration::new(&target, &source, &modes, sigma_only)
+            .unwrap()
+            .register()
+            .unwrap();
+        let b = AtlasRegistration::new(&target, &source, &modes, both)
+            .unwrap()
+            .register()
+            .unwrap();
+        let w = AtlasRegistration::new(&target, &source, &modes, weight_only)
+            .unwrap()
+            .register()
+            .unwrap();
+        for (x, y) in a.coefficients.iter().zip(&b.coefficients) {
+            assert!((x - y).abs() < 1e-12, "sigma-only {x} vs both {y}");
+        }
+        assert!((a.landmark_rms - b.landmark_rms).abs() < 1e-12);
+        // Guard against the two branches coinciding by accident: the
+        // heuristic-weight fit must actually differ from the fixed-variance one.
+        let differs = a
+            .coefficients
+            .iter()
+            .zip(&w.coefficients)
+            .any(|(x, y)| (x - y).abs() > 1e-6);
+        assert!(differs, "fixed-variance and weight-only fits must differ");
+    }
+
+    #[test]
+    fn tiny_landmark_sigma_stays_finite_and_anchors() {
+        // A very small (but finite) landmark_sigma must not produce NaN/inf and
+        // must anchor the landmark vertices essentially exactly. The internal
+        // `.max(f64::MIN_POSITIVE)` guard keeps the effective mass finite.
+        let (source, modes, _) = model();
+        let truth = [0.8_f64, -0.6];
+        let target = DMatrix::from_fn(8, 3, |i, j| {
+            source[(i, j)]
+                + (0..2)
+                    .map(|k| modes[(i * 3 + j, k)] * truth[k])
+                    .sum::<f64>()
+        });
+        let landmarks: Vec<(usize, Vec<f64>)> = [1usize, 4, 6]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| target[(i, j)]).collect()))
+            .collect();
+        let fit =
+            AtlasRegistration::new(&target, &source, &modes, sim_config(Some(1e-6), landmarks))
+                .unwrap()
+                .register()
+                .unwrap();
+        assert!(fit.sigma2.is_finite() && fit.landmark_rms.is_finite());
+        assert!(fit.coefficients.iter().all(|c| c.is_finite()));
+        assert!(fit.landmark_rms < 1e-3, "landmark_rms {}", fit.landmark_rms);
+    }
+
+    #[test]
+    fn principled_sigma2_survives_extreme_tau_without_cancellation() {
+        // Regression for catastrophic cancellation in the surface-only sigma2.
+        // With an extreme `τ` on large-coordinate data the landmark mass is many
+        // orders of magnitude above the surface mass, so forming the surface
+        // variance as `ypy_aug - lm_ypy` (subtracting the huge augmented landmark
+        // term back out) would lose all precision. Placing CONSISTENT landmarks
+        // (exactly at the landmark-free fit) must leave the principled surface
+        // `sigma2` essentially identical to the landmark-free value.
+        let (source, modes, _) = model();
+        let big = 1.0e3;
+        let src = source.map(|v| v * big);
+        let modes_big = modes.map(|v| v * big);
+        let (c, s) = (0.2_f64.cos(), 0.2_f64.sin());
+        let rmat = DMatrix::from_row_slice(3, 3, &[c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0]);
+        // Rigidly rotated large-scale target plus a small non-model wobble, so
+        // there is a genuine surface residual for sigma2 to measure.
+        let target = DMatrix::from_fn(8, 3, |i, j| {
+            (0..3).map(|q| src[(i, q)] * rmat[(q, j)]).sum::<f64>()
+                + 0.5 * ((i * 3 + j) as f64).sin()
+        });
+        let base = AtlasRegistration::new(&target, &src, &modes_big, sim_config(None, Vec::new()))
+            .unwrap()
+            .register()
+            .unwrap();
+        assert!(base.sigma2 > 0.0 && base.sigma2.is_finite());
+        // Consistent landmarks at the landmark-free fit; `τ = 1e-6` is minuscule
+        // against the ~1e3 coordinate scale, so the landmark mass ~ sigma2/1e-12.
+        let landmarks: Vec<(usize, Vec<f64>)> = [1usize, 4, 6]
+            .iter()
+            .map(|&i| (i, (0..3).map(|j| base.points[(i, j)]).collect()))
+            .collect();
+        let tight =
+            AtlasRegistration::new(&target, &src, &modes_big, sim_config(Some(1e-6), landmarks))
+                .unwrap()
+                .register()
+                .unwrap();
+        assert!(tight.sigma2.is_finite() && tight.sigma2 > 0.0);
+        // Surface variance unchanged by the (consistent) anchors to high relative
+        // precision — the direct computation carries the surface signal exactly.
+        assert!(
+            (tight.sigma2 - base.sigma2).abs() < 1e-6 * base.sigma2,
+            "tight {} vs base {}",
+            tight.sigma2,
+            base.sigma2
+        );
+    }
 }
