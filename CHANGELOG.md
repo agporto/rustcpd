@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-08-18
+
 ### Added
 
 - Optional anchored-keypoint (landmark) terms for fragment workflows whose
@@ -373,6 +375,7 @@ faster. Numerical agreement with the original is ≤ 3e-12 relative across a
 parity suite covering every registration family. See
 [`rustcpd/BENCHMARKS.md`](rustcpd/BENCHMARKS.md).
 
+[3.1.0]: https://github.com/agporto/rustcpd/releases/tag/v3.1.0
 [3.0.0]: https://github.com/agporto/rustcpd/releases/tag/v3.0.0
 
 <!-- 2.1.0 and earlier predate the public repository and have no tags. -->
