@@ -153,13 +153,17 @@ pub struct PoseMarginalizedConfig {
     pub merge_tolerance: f64,
     /// Starting variance for every coarse and refinement EM, in the
     /// normalized frame the atlas runs in (target centred, RMS radius 1).
+    ///
     /// `None` (default) uses the classic pairwise estimate from the posed
-    /// model, which for a fragment is dominated by the *whole model's*
-    /// extent and starts the annealing so soft that the first M-steps pull
-    /// the model back toward centering on the fragment. With translation
-    /// seeding the correct hypotheses already start close, so a variance on
-    /// the fragment's own scale — `Some(0.1)`–`Some(0.3)` — is both safe for
-    /// them and more discriminating against the wrong ones.
+    /// model — **unless translation seeding activated**, in which case
+    /// [`FRAGMENT_INITIAL_SIGMA2`] is used. The classic estimate is dominated
+    /// by the *whole model's* extent; for a fragment it starts the annealing
+    /// so soft that the first M-steps re-centre the model on the fragment
+    /// before any seed can take hold (this alone, not the seeds, decided the
+    /// outcome in testing). Seeded hypotheses already start close, so a
+    /// variance on the fragment's own scale is safe for the right ones and
+    /// more discriminating against the wrong ones. Set `Some(v)` to override
+    /// in either case.
     pub initial_sigma2: Option<f64>,
 }
 
@@ -245,6 +249,14 @@ pub struct PoseMarginalizedInitialization {
     pub translation_anchors_used: usize,
 }
 
+/// Default starting variance (normalized frame, target RMS radius = 1) for
+/// searches where translation seeding activated; see
+/// [`PoseMarginalizedConfig::initial_sigma2`]. Roughly the squared residual
+/// of a correct seed — anchor error plus rotation-lattice spacing over a
+/// fragment-sized extent — and about a third of the classic two-coincident-
+/// clouds estimate `2/D`.
+pub const FRAGMENT_INITIAL_SIGMA2: f64 = 0.25;
+
 #[derive(Clone)]
 struct Candidate {
     /// Flat hypothesis id `rotation_index · anchors + anchor_index`
@@ -294,7 +306,12 @@ impl PoseMarginalizedConfig {
         // behavior); further anchors are fragment-sized local centroids of
         // the model, added only when the target is demonstrably smaller than
         // the (scale-constrained) model. See `translation_anchors`.
-        let seed = SeedFrame::new(&coarse_source, &coarse_target, self.with_scale, scale_bounds);
+        let seed = SeedFrame::new(
+            &coarse_source,
+            &coarse_target,
+            self.with_scale,
+            scale_bounds,
+        );
         let anchors = translation_anchors(
             &coarse_source,
             &seed,
@@ -302,6 +319,10 @@ impl PoseMarginalizedConfig {
             self.anchor_completeness_threshold,
         );
         let anchor_count = anchors.len();
+        // Fragment searches anneal from the fragment's scale, not the model's.
+        let initial_sigma2 = self
+            .initial_sigma2
+            .or_else(|| (anchor_count > 1).then_some(FRAGMENT_INITIAL_SIGMA2));
         // Flat hypothesis list: id = rotation_index · anchor_count + anchor_index,
         // so id 0 is (identity rotation, centroid anchor).
         let hypotheses: Vec<(usize, usize)> = (0..rotations.len())
@@ -320,7 +341,7 @@ impl PoseMarginalizedConfig {
             let translation = seed.translation(rotation, &anchors[anchor_index]);
             let config = AtlasConfig {
                 em: EmConfig {
-                    sigma2: self.initial_sigma2,
+                    sigma2: initial_sigma2,
                     max_iterations: max_iters,
                     tolerance: 0.0,
                     outlier_weight: self.outlier_weight,
@@ -410,8 +431,7 @@ impl PoseMarginalizedConfig {
         // it scales with the anchor count so the funnel keeps the same
         // fraction of the (larger) hypothesis set.
         let survivor_count = self.coarse_survivor_count.saturating_mul(anchor_count);
-        let use_funnel =
-            screen_iters < self.coarse_iterations && survivor_count < hypotheses.len();
+        let use_funnel = screen_iters < self.coarse_iterations && survivor_count < hypotheses.len();
         let mut coarse: Vec<Candidate> = if use_funnel {
             // Screen every hypothesis cheaply, keep the best survivors (the
             // identity/centroid hypothesis always retained), then complete
@@ -465,7 +485,7 @@ impl PoseMarginalizedConfig {
             coefficients[..initial.coefficients.len()].copy_from_slice(&initial.coefficients);
             let config = AtlasConfig {
                 em: EmConfig {
-                    sigma2: self.initial_sigma2,
+                    sigma2: initial_sigma2,
                     max_iterations: self.refine_iterations,
                     tolerance: 0.0,
                     outlier_weight: self.outlier_weight,
@@ -551,8 +571,7 @@ impl PoseMarginalizedConfig {
         // several starts landing in the winner's basin (strong evidence for
         // it) would read as ambiguity.
         let merge_radius = self.merge_tolerance * rms_radius(&refined_target);
-        let mut clusters =
-            merge_converged(refined, &refined_source, &refined_modes, merge_radius);
+        let mut clusters = merge_converged(refined, &refined_source, &refined_modes, merge_radius);
         let min_score = clusters[0].score;
         let normalizer = clusters
             .iter()
@@ -1145,8 +1164,12 @@ fn score_candidate(
     let inorm = (1. - w).ln()
         - (m as f64).ln()
         - 0.5 * d as f64 * (2. * std::f64::consts::PI * sigma2).ln();
-    let log_mixing: Option<Vec<f64>> =
-        mixing.map(|values| values.iter().map(|&v| v.max(f64::MIN_POSITIVE).ln()).collect());
+    let log_mixing: Option<Vec<f64>> = mixing.map(|values| {
+        values
+            .iter()
+            .map(|&v| v.max(f64::MIN_POSITIVE).ln())
+            .collect()
+    });
     let out = if w > 0. {
         w.ln() - (n as f64).ln()
     } else {
@@ -1758,7 +1781,11 @@ mod fragment_seeding_tests {
         // Proximal third; its true centroid sits at x ≈ 0.667.
         let fragment = DMatrix::from_fn(20, 3, |i, j| model[(i, j)]);
         let seed = SeedFrame::new(&model, &fragment, false, None);
-        assert!(seed.completeness() < 0.5, "completeness={}", seed.completeness());
+        assert!(
+            seed.completeness() < 0.5,
+            "completeness={}",
+            seed.completeness()
+        );
         let anchors = translation_anchors(&model, &seed, 6, 0.9);
         assert!(anchors.len() > 1, "fragment must produce extra anchors");
         // Anchor 0 is the model centroid.
@@ -1783,7 +1810,11 @@ mod fragment_seeding_tests {
         assert!(t.iter().all(|v| v.abs() < 1e-9), "t={t:?}");
         // With scale bounds the clamped scale is used for the seed.
         let bounded = SeedFrame::new(&model, &fragment, true, Some((0.8, 1.25)));
-        assert!((bounded.scale - 0.8).abs() < 1e-12, "scale={}", bounded.scale);
+        assert!(
+            (bounded.scale - 0.8).abs() < 1e-12,
+            "scale={}",
+            bounded.scale
+        );
         assert!(bounded.completeness() < 0.9);
     }
 
@@ -1797,7 +1828,10 @@ mod fragment_seeding_tests {
         let target = transform(&fragment_model, &rotation, &offset);
         // Plain seeding, then the full fragment recipe (seeding + adaptive
         // mixing + fragment-scale starting variance).
-        for (initial_sigma2, adaptive) in [(None, None), (Some(0.2), Some(1.0))] {
+        // Plain seeding (fragment-scale sigma2 is applied automatically),
+        // seeding + adaptive mixing, and an explicit sigma2 override.
+        for (initial_sigma2, adaptive) in [(None, None), (None, Some(1.0)), (Some(0.2), Some(1.0))]
+        {
             let config = PoseMarginalizedConfig {
                 rotation_count: 9,
                 coarse_source_count: 60,
@@ -1816,7 +1850,10 @@ mod fragment_seeding_tests {
                 ..Default::default()
             };
             let init = config.initialize(&model, &target, &modes, &[1.0]).unwrap();
-            assert!(init.translation_anchors_used > 1, "seeding did not activate");
+            assert!(
+                init.translation_anchors_used > 1,
+                "seeding did not activate"
+            );
             assert_eq!(init.hypotheses_evaluated, 9 * init.translation_anchors_used);
             let posed = DMatrix::from_fn(20, 3, |i, j| {
                 init.scale
@@ -1857,12 +1894,15 @@ mod fragment_seeding_tests {
         let refined = vec![
             make(10.0, 0.0, [0.0, 0.0, 0.0]),
             make(10.5, 1e-4, [1e-4, 0.0, 0.0]), // same fit, converged from elsewhere
-            make(40.0, 1.5, [0.7, 0.0, 0.0]),  // a genuinely different basin
+            make(40.0, 1.5, [0.7, 0.0, 0.0]),   // a genuinely different basin
         ];
         let clusters = merge_converged(refined, &model, &modes, 0.02);
         assert_eq!(clusters.len(), 2);
         assert_eq!(clusters[0].support, 2);
         assert_eq!(clusters[1].support, 1);
-        assert!((clusters[0].score - 10.0).abs() < 1e-12, "best member represents");
+        assert!(
+            (clusters[0].score - 10.0).abs() < 1e-12,
+            "best member represents"
+        );
     }
 }

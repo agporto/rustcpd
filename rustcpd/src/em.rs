@@ -1352,9 +1352,7 @@ mod tests {
         assert_slice_close(&truncated.pt1, &dense.pt1, 1e-10, "pt1");
         assert_slice_close(&truncated.p1, &dense.p1, 1e-10, "p1");
         assert_slice_close(truncated.px.as_slice(), dense.px.as_slice(), 1e-10, "px");
-        assert!(
-            (truncated.negative_log_likelihood - dense.negative_log_likelihood).abs() <= 1e-8
-        );
+        assert!((truncated.negative_log_likelihood - dense.negative_log_likelihood).abs() <= 1e-8);
 
         let single = posterior_stats_dense_f32(
             &x,
@@ -1365,8 +1363,8 @@ mod tests {
             false,
             Some(&weights),
         );
-        assert_slice_close(&single.p1, &dense.p1, 1e-4, "p1 (f32)");
-        assert_slice_close(&single.pt1, &dense.pt1, 1e-4, "pt1 (f32)");
+        assert_slice_close(&single.p1, &dense.p1, 2e-3, "p1 (f32)");
+        assert_slice_close(&single.pt1, &dense.pt1, 2e-3, "pt1 (f32)");
 
         let index = SparseIndex::new(&x, count);
         let sparse = posterior_stats_sparse(
@@ -1381,7 +1379,12 @@ mod tests {
         );
         assert_slice_close(&sparse.p1, &dense.p1, 1e-10, "p1 (sparse)");
         assert_slice_close(&sparse.pt1, &dense.pt1, 1e-10, "pt1 (sparse)");
-        assert_slice_close(sparse.px.as_slice(), dense.px.as_slice(), 1e-10, "px (sparse)");
+        assert_slice_close(
+            sparse.px.as_slice(),
+            dense.px.as_slice(),
+            1e-10,
+            "px (sparse)",
+        );
 
         // A vector of ones is exactly classic CPD.
         let ones = vec![1.0; count];

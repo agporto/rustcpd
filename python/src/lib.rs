@@ -958,10 +958,11 @@ fn register_atlas(
 /// pinned down (`with_scale=False` or `scale_bounds=(lo, hi)`) and only
 /// activates when the target is smaller than `anchor_completeness_threshold`
 /// of the model, so complete targets are unaffected. `adaptive_mixing=alpha`
-/// lets unobserved model points switch off, and `initial_sigma2` (in the
-/// normalized frame, target RMS radius = 1; try 0.1-0.3) starts the annealing
-/// at the fragment's own scale. `merge_tolerance` merges refined starts that
-/// converged to the same fit before the ambiguity diagnostics are computed.
+/// lets unobserved model points switch off. When seeding activates the EM
+/// anneals from `initial_sigma2` = 0.25 (normalized frame, target RMS
+/// radius = 1) instead of the whole-model estimate; pass `initial_sigma2` to
+/// override. `merge_tolerance` merges refined starts that converged to the
+/// same fit before the ambiguity diagnostics are computed.
 #[pyfunction]
 #[pyo3(signature = (source, target, modes, eigenvalues, *,
     rotation_count = 193, coarse_source_count = 400,

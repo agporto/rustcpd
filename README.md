@@ -146,14 +146,17 @@ init = cpd.pose_initialize(
     source, fragment, modes, eigenvalues,
     with_scale=False,               # or scale_bounds=(0.8, 1.25)
     translation_anchor_count=6,     # + fragment-sized local centroids of the model
-    adaptive_mixing=1.0,            # unobserved model points switch themselves off
-    initial_sigma2=0.2,             # anneal from the fragment's scale, not the bone's
+    adaptive_mixing=1.0,            # optional: unobserved model points switch off
 )
 init.translation_anchors_used       # 1 when the target looked complete
 ```
 
 Seeding only activates when the target is smaller than the model, so
-complete targets cost nothing extra. `register_atlas` accepts
+complete targets cost nothing extra. When it does activate, the EM anneals
+from the fragment's own scale (`initial_sigma2` defaults to 0.25 in the
+normalized frame) instead of the whole model's — in testing that, not the
+seeds themselves, is what decides whether the fragment lands at the right
+end. `register_atlas` accepts
 `scale_bounds` and `adaptive_mixing` too (`result.mixing_weights` shows
 which model points the data supported).
 

@@ -884,7 +884,6 @@ def test_pose_initialize_seeds_translations_for_a_displaced_fragment():
         [1.0],
         translation_anchor_count=6,
         adaptive_mixing=1.0,
-        initial_sigma2=0.2,
         **common,
     )
     assert init.translation_anchors_used > 1

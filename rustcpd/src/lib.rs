@@ -48,5 +48,7 @@ pub use em::{
 };
 pub use error::{Error, Result};
 pub use nalgebra::DMatrix;
-pub use pose::{PoseMarginalizedConfig, PoseMarginalizedInitialization, PoseScoreMode};
+pub use pose::{
+    FRAGMENT_INITIAL_SIGMA2, PoseMarginalizedConfig, PoseMarginalizedInitialization, PoseScoreMode,
+};
 pub use rigid::{RigidConfig, RigidRegistration, RigidResult};

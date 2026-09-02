@@ -500,10 +500,7 @@ impl<'a> AtlasRegistration<'a> {
         // Adaptive mixing: `pi` are the proportions (sum to 1), `mixing`
         // the relative factors `M·pi` the E-step consumes. Both start
         // uniform, so the first E-step is exactly classic CPD.
-        let mut pi: Option<Vec<f64>> = self
-            .config
-            .adaptive_mixing
-            .map(|_| vec![1.0 / m as f64; m]);
+        let mut pi: Option<Vec<f64>> = self.config.adaptive_mixing.map(|_| vec![1.0 / m as f64; m]);
         let mut mixing: Option<Vec<f64>> = pi.as_ref().map(|_| vec![1.0; m]);
         while iterations < self.config.em.max_iterations && diff > self.config.em.tolerance {
             if !sparse_active && sparse_threshold.is_some_and(|threshold| sigma2 < threshold) {
@@ -1394,10 +1391,18 @@ mod fragment_tests {
         .unwrap()
         .register()
         .unwrap();
-        let pi = adaptive.mixing_weights.expect("adaptive mixing reports proportions");
+        let pi = adaptive
+            .mixing_weights
+            .expect("adaptive mixing reports proportions");
         assert_eq!(pi.len(), 60);
-        assert!((pi.iter().sum::<f64>() - 1.0).abs() < 1e-9, "pi must sum to 1");
-        assert!(pi.iter().all(|&v| v > 0.0), "Dirichlet floor keeps pi positive");
+        assert!(
+            (pi.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+            "pi must sum to 1"
+        );
+        assert!(
+            pi.iter().all(|&v| v > 0.0),
+            "Dirichlet floor keeps pi positive"
+        );
         let observed: f64 = pi[..20].iter().sum();
         let unobserved: f64 = pi[20..].iter().sum();
         assert!(

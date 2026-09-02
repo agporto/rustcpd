@@ -34,8 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gains an internal `posterior_stats_weighted` applied identically on the
   dense, single-precision, truncated and k-NN paths.
 - `PoseMarginalizedConfig::initial_sigma2`: starting variance for the coarse
-  and refinement EM in the normalized frame, letting fragment searches anneal
-  from the fragment's own scale rather than the whole model's.
+  and refinement EM in the normalized frame. When translation seeding
+  activates and this is `None`, the search now anneals from
+  `FRAGMENT_INITIAL_SIGMA2 = 0.25` (the fragment's scale) instead of the
+  classic whole-model estimate — in testing this, not the seeds, decided
+  whether a displaced fragment was recovered.
 - Pose diagnostics `distinct_hypotheses`, `winner_support` and
   `translation_anchors_used`.
 

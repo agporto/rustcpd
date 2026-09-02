@@ -169,13 +169,18 @@ The fragment recipe, in order of importance:
    are unchanged. Coarse cost scales with the anchors actually used; use the
    screening funnel (`coarse_screen_iterations < coarse_iterations`,
    `coarse_survivor_count` per rotation) to keep it cheap.
-3. **`adaptive_mixing=1.0`.** Lets model points with no data switch off, which
-   removes the centring pull and gives the fragment's distinctive points their
-   proper weight. Smaller `alpha` switches off faster; larger stays closer to
-   classic CPD.
-4. **`initial_sigma2=0.1–0.3`** (normalized frame, target RMS radius = 1).
-   Correct seeds already start close, so annealing from the fragment's own
-   scale is safe for them and more discriminating against the wrong ones.
+3. **Starting variance.** When seeding activates, `initial_sigma2` defaults
+   to 0.25 (normalized frame, target RMS radius = 1) instead of the classic
+   whole-model estimate. This matters more than anything else on the list:
+   on a tapered test rod the seeds alone recovered nothing (the first
+   soft M-steps re-centred the model before any seed could take hold), while
+   a fragment-scale start recovered the pose with or without adaptive mixing.
+   Override with `initial_sigma2=` if your fragment is unusually noisy
+   (larger) or the rotation lattice is dense (smaller).
+4. **`adaptive_mixing=1.0`** (optional). Lets model points with no data switch
+   off, which removes the residual centring pull and gives the fragment's
+   distinctive points their proper weight in the fit and the score. Smaller
+   `alpha` switches off faster; larger stays closer to classic CPD.
 
 Read `translation_anchors_used` to confirm seeding activated, and
 `winner_support` / `distinct_hypotheses` to see how many refined starts
