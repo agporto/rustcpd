@@ -546,6 +546,7 @@ fn brute_edges(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn posterior_stats_sparse(
     x: &DMatrix<f64>,
     ty: &DMatrix<f64>,
@@ -1094,6 +1095,7 @@ fn bounding_box_diagonal_squared(points: &DMatrix<f64>) -> f64 {
 /// Returns `None` when a deterministic probe of evenly spaced targets
 /// finds the active set still too large for range queries to beat the
 /// streaming dense path.
+#[allow(clippy::too_many_arguments)]
 fn posterior_stats_truncated<const K: usize>(
     x: &DMatrix<f64>,
     ty: &DMatrix<f64>,

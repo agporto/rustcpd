@@ -531,11 +531,13 @@ impl<'a> AtlasRegistration<'a> {
                 (self.config.adaptive_mixing, pi.as_mut(), mixing.as_mut())
             {
                 let total = stats.np + alpha * m as f64;
-                for i in 0..m {
-                    pi[i] = (stats.p1[i] + alpha) / total;
+                for ((proportion, factor), &mass) in
+                    pi.iter_mut().zip(mixing.iter_mut()).zip(&stats.p1)
+                {
+                    *proportion = (mass + alpha) / total;
                     // Relative factor for the next E-step, floored so the
                     // truncated path always has a finite weight range.
-                    mixing[i] = (pi[i] * m as f64).max(1e-9);
+                    *factor = (*proportion * m as f64).max(1e-9);
                 }
             }
             // Anchored-keypoint term: fold each landmark into the sufficient

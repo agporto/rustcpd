@@ -106,6 +106,61 @@ pub struct PoseMarginalizedConfig {
     /// Run the coarse and refinement E-steps in single precision; see
     /// [`crate::EmConfig::single_precision`].
     pub single_precision: bool,
+    /// Number of translation seeds per rotation (default `1`).
+    ///
+    /// Every rotation hypothesis needs a starting translation. The classic
+    /// seed places the *model centroid* on the target centroid, which is
+    /// exactly right for a complete target and exactly wrong for a
+    /// fragment: the proximal third of a femur has its centroid a third of
+    /// the way along the bone, not in the middle. Values `> 1` add
+    /// fragment-sized **local centroids** of the model as extra anchors —
+    /// farthest-point samples of the model, each replaced by the centroid of
+    /// the model points around it whose RMS radius matches the target's —
+    /// and seed one translation per anchor: `t = c_target − s·(a_k·R)`,
+    /// i.e. "the target is the part of the model around `a_k`". Anchor 0 is
+    /// always the model centroid, so the classic hypothesis is never lost.
+    ///
+    /// Seeding activates only when the target is demonstrably smaller than
+    /// the model (see [`Self::anchor_completeness_threshold`]) **and** the
+    /// scale is pinned down — `with_scale = false` or [`Self::scale_bounds`]
+    /// set. With a free scale the RMS-radius ratio absorbs the size
+    /// difference (the model simply shrinks into the fragment), the
+    /// completeness estimate reads 1, and the seeds collapse to the centroid.
+    /// The coarse cost scales with the number of anchors actually used;
+    /// refinement cost does not.
+    pub translation_anchor_count: usize,
+    /// Target-to-model RMS-radius ratio (after the seed scale) at or above
+    /// which the target is treated as complete and no extra translation
+    /// anchors are added, regardless of [`Self::translation_anchor_count`].
+    /// Default `0.9`.
+    pub anchor_completeness_threshold: f64,
+    /// Optional `(min, max)` bounds on the similarity scale, applied to every
+    /// seed and every EM scale estimate (coarse and refinement); forwarded to
+    /// [`crate::AtlasConfig::scale_bounds`]. Strongly recommended for partial
+    /// targets when `with_scale` is on. Ignored when `with_scale = false`.
+    pub scale_bounds: Option<(f64, f64)>,
+    /// Adaptive per-source mixing proportions for the coarse and refinement
+    /// EM; forwarded to [`crate::AtlasConfig::adaptive_mixing`]. Lets model
+    /// points with no supporting data switch off, which removes the
+    /// centering bias for partial targets. The refined proportions also enter
+    /// the final full-cloud score. `None` (default) is classic CPD.
+    pub adaptive_mixing: Option<f64>,
+    /// Refined hypotheses whose fitted models differ by an RMS distance below
+    /// `merge_tolerance × RMS-radius(target)` are treated as the same solution
+    /// when computing [`PoseMarginalizedInitialization::score_margin`],
+    /// `posterior_entropy`, `effective_hypotheses` and `distinct_hypotheses`.
+    /// Default `0.02`. `0` disables merging.
+    pub merge_tolerance: f64,
+    /// Starting variance for every coarse and refinement EM, in the
+    /// normalized frame the atlas runs in (target centred, RMS radius 1).
+    /// `None` (default) uses the classic pairwise estimate from the posed
+    /// model, which for a fragment is dominated by the *whole model's*
+    /// extent and starts the annealing so soft that the first M-steps pull
+    /// the model back toward centering on the fragment. With translation
+    /// seeding the correct hypotheses already start close, so a variance on
+    /// the fragment's own scale — `Some(0.1)`–`Some(0.3)` — is both safe for
+    /// them and more discriminating against the wrong ones.
+    pub initial_sigma2: Option<f64>,
 }
 
 impl Default for PoseMarginalizedConfig {
@@ -135,6 +190,12 @@ impl Default for PoseMarginalizedConfig {
             seed: 0,
             parallel: true,
             single_precision: false,
+            translation_anchor_count: 1,
+            anchor_completeness_threshold: 0.9,
+            scale_bounds: None,
+            adaptive_mixing: None,
+            merge_tolerance: 0.02,
+            initial_sigma2: None,
         }
     }
 }
@@ -162,27 +223,46 @@ pub struct PoseMarginalizedInitialization {
     /// Score gap to the runner-up; larger means more decisive. Same within-run
     /// caveat as [`Self::score`].
     pub score_margin: f64,
-    /// Shannon entropy of the refined-hypothesis posterior.
+    /// Shannon entropy of the posterior over *distinct* refined solutions
+    /// (starts that converged to the same fit are merged first, see
+    /// [`PoseMarginalizedConfig::merge_tolerance`]).
     pub posterior_entropy: f64,
     /// `exp(posterior_entropy)` — the effective number of competitive
-    /// hypotheses.
+    /// distinct solutions. `≈ 1` means the winner stands alone; larger
+    /// values mean genuinely different fits score comparably (symmetry).
     pub effective_hypotheses: f64,
-    /// Total rotation hypotheses evaluated in the coarse pass.
+    /// Total hypotheses evaluated in the coarse pass (rotations × translation
+    /// anchors).
     pub hypotheses_evaluated: usize,
-    /// Hypotheses carried through refinement.
+    /// Hypotheses carried through refinement (before merging).
     pub hypotheses_refined: usize,
+    /// Distinct solutions among the refined hypotheses after merging.
+    pub distinct_hypotheses: usize,
+    /// Refined starts that converged to the winning solution. Several starts
+    /// agreeing is *evidence for* the winner, not ambiguity.
+    pub winner_support: usize,
+    /// Translation anchors actually used per rotation (1 = centroid only).
+    pub translation_anchors_used: usize,
 }
 
 #[derive(Clone)]
 struct Candidate {
-    /// Lattice rotation index this hypothesis started from (0 = identity).
+    /// Flat hypothesis id `rotation_index · anchors + anchor_index`
+    /// (0 = identity rotation with the centroid anchor).
     index: usize,
+    /// Lattice rotation index this hypothesis started from (0 = identity).
+    rotation_index: usize,
+    /// Translation anchor this hypothesis started from (0 = model centroid).
+    #[allow(dead_code)]
+    anchor_index: usize,
     score: f64,
     coefficients: Vec<f64>,
     rotation: DMatrix<f64>,
     scale: f64,
     translation: Vec<f64>,
     prior_cost: f64,
+    /// Number of refined starts merged into this candidate.
+    support: usize,
 }
 
 impl PoseMarginalizedConfig {
@@ -205,114 +285,142 @@ impl PoseMarginalizedConfig {
         let rotations = rotation_lattice(self.rotation_count, self.seed);
         let nonidentity_prior =
             (1.0 - self.identity_prior_probability) / (rotations.len() - 1).max(1) as f64;
-        // Evaluate one rotation hypothesis: run `max_iters` of coarse atlas EM
-        // from its initial similarity and score it under the configured mode.
-        let evaluate =
-            |index: usize, rotation: &DMatrix<f64>, max_iters: usize| -> Result<Candidate> {
-                let prior = if index == 0 {
-                    self.identity_prior_probability
-                } else {
-                    nonidentity_prior
-                };
-                let (scale, translation) =
-                    initial_similarity(&coarse_source, &coarse_target, rotation, self.with_scale);
-                let config = AtlasConfig {
-                    em: EmConfig {
-                        max_iterations: max_iters,
-                        tolerance: 0.0,
-                        outlier_weight: self.outlier_weight,
-                        parallel: false,
-                        single_precision: self.single_precision,
-                        ..Default::default()
-                    },
-                    eigenvalues: eigenvalues[..rank].to_vec(),
-                    lambda_regularization: self.lambda_regularization,
-                    normalize: true,
-                    optimize_similarity: true,
-                    with_scale: self.with_scale,
-                    initial_rotation: Some(rotation.clone()),
-                    initial_scale: scale,
-                    initial_translation: Some(translation),
-                    ..Default::default()
-                };
-                let result =
-                    AtlasRegistration::new(&coarse_target, &coarse_source, &coarse_modes, config)?
-                        .register()?;
-                let data_cost = match self.coarse_score_mode {
-                    // score_candidate already folds in the shape-prior term.
-                    PoseScoreMode::Final => score_candidate(
-                        &coarse_target,
-                        &result.points,
-                        result.sigma2,
-                        self.outlier_weight,
-                        &result.coefficients,
-                        &eigenvalues[..rank],
-                        self.lambda_regularization,
-                    ),
-                    // Running EM data objective plus the shape prior, matching the
-                    // reference "trajectory" score. Comparable across hypotheses
-                    // because every candidate shares the same normalized target.
-                    PoseScoreMode::Trajectory => {
-                        let shape_cost = 0.5
-                            * self.lambda_regularization
-                            * result
-                                .coefficients
-                                .iter()
-                                .zip(&eigenvalues[..rank])
-                                .map(|(b, e)| b * b / e.max(f64::EPSILON))
-                                .sum::<f64>();
-                        result.negative_log_likelihood + shape_cost
-                    }
-                };
-                let kp_penalty = self.keypoint_penalty(
-                    source,
-                    modes,
-                    &result.coefficients,
-                    &result.rotation,
-                    result.scale,
-                    &result.translation,
-                    result.sigma2,
-                );
-                Ok(Candidate {
-                    index,
-                    score: data_cost - prior.ln() + kp_penalty,
-                    coefficients: result.coefficients,
-                    rotation: result.rotation,
-                    scale: result.scale,
-                    translation: result.translation,
-                    prior_cost: -prior.ln(),
-                })
-            };
-        // Map `evaluate` over a set of (index, rotation) items at a given budget.
-        let map_eval = |items: &[(usize, &DMatrix<f64>)], iters: usize| -> Result<Vec<Candidate>> {
-            if self.parallel {
-                items
-                    .par_iter()
-                    .map(|&(i, r)| evaluate(i, r, iters))
-                    .collect()
+        let scale_bounds = if self.with_scale {
+            self.scale_bounds
+        } else {
+            None
+        };
+        // Translation seeds. Anchor 0 is always the model centroid (today's
+        // behavior); further anchors are fragment-sized local centroids of
+        // the model, added only when the target is demonstrably smaller than
+        // the (scale-constrained) model. See `translation_anchors`.
+        let seed = SeedFrame::new(&coarse_source, &coarse_target, self.with_scale, scale_bounds);
+        let anchors = translation_anchors(
+            &coarse_source,
+            &seed,
+            self.translation_anchor_count,
+            self.anchor_completeness_threshold,
+        );
+        let anchor_count = anchors.len();
+        // Flat hypothesis list: id = rotation_index · anchor_count + anchor_index,
+        // so id 0 is (identity rotation, centroid anchor).
+        let hypotheses: Vec<(usize, usize)> = (0..rotations.len())
+            .flat_map(|r| (0..anchor_count).map(move |a| (r, a)))
+            .collect();
+        // Evaluate one hypothesis: run `max_iters` of coarse atlas EM from
+        // its initial similarity and score it under the configured mode.
+        let evaluate = |id: usize, max_iters: usize| -> Result<Candidate> {
+            let (rotation_index, anchor_index) = hypotheses[id];
+            let rotation = &rotations[rotation_index];
+            let prior = if rotation_index == 0 {
+                self.identity_prior_probability
             } else {
-                items.iter().map(|&(i, r)| evaluate(i, r, iters)).collect()
+                nonidentity_prior
+            };
+            let translation = seed.translation(rotation, &anchors[anchor_index]);
+            let config = AtlasConfig {
+                em: EmConfig {
+                    sigma2: self.initial_sigma2,
+                    max_iterations: max_iters,
+                    tolerance: 0.0,
+                    outlier_weight: self.outlier_weight,
+                    parallel: false,
+                    single_precision: self.single_precision,
+                    ..Default::default()
+                },
+                eigenvalues: eigenvalues[..rank].to_vec(),
+                lambda_regularization: self.lambda_regularization,
+                normalize: true,
+                optimize_similarity: true,
+                with_scale: self.with_scale,
+                initial_rotation: Some(rotation.clone()),
+                initial_scale: seed.scale,
+                initial_translation: Some(translation),
+                scale_bounds,
+                adaptive_mixing: self.adaptive_mixing,
+                ..Default::default()
+            };
+            let result =
+                AtlasRegistration::new(&coarse_target, &coarse_source, &coarse_modes, config)?
+                    .register()?;
+            let mixing = mixing_factors(result.mixing_weights.as_deref());
+            let data_cost = match self.coarse_score_mode {
+                // score_candidate already folds in the shape-prior term.
+                PoseScoreMode::Final => score_candidate(
+                    &coarse_target,
+                    &result.points,
+                    result.sigma2,
+                    self.outlier_weight,
+                    &result.coefficients,
+                    &eigenvalues[..rank],
+                    self.lambda_regularization,
+                    mixing.as_deref(),
+                ),
+                // Running EM data objective plus the shape prior, matching the
+                // reference "trajectory" score. Comparable across hypotheses
+                // because every candidate shares the same normalized target.
+                PoseScoreMode::Trajectory => {
+                    let shape_cost = 0.5
+                        * self.lambda_regularization
+                        * result
+                            .coefficients
+                            .iter()
+                            .zip(&eigenvalues[..rank])
+                            .map(|(b, e)| b * b / e.max(f64::EPSILON))
+                            .sum::<f64>();
+                    result.negative_log_likelihood + shape_cost
+                }
+            };
+            let kp_penalty = self.keypoint_penalty(
+                source,
+                modes,
+                &result.coefficients,
+                &result.rotation,
+                result.scale,
+                &result.translation,
+                result.sigma2,
+            );
+            Ok(Candidate {
+                index: id,
+                rotation_index,
+                anchor_index,
+                score: data_cost - prior.ln() + kp_penalty,
+                coefficients: result.coefficients,
+                rotation: result.rotation,
+                scale: result.scale,
+                translation: result.translation,
+                prior_cost: -prior.ln(),
+                support: 1,
+            })
+        };
+        // Map `evaluate` over a set of hypothesis ids at a given budget.
+        let map_eval = |ids: &[usize], iters: usize| -> Result<Vec<Candidate>> {
+            if self.parallel {
+                ids.par_iter().map(|&id| evaluate(id, iters)).collect()
+            } else {
+                ids.iter().map(|&id| evaluate(id, iters)).collect()
             }
         };
 
-        let indexed: Vec<(usize, &DMatrix<f64>)> = rotations.iter().enumerate().collect();
+        let all_ids: Vec<usize> = (0..hypotheses.len()).collect();
         // Screening runs a prefix of the coarse budget; cap it so an over-large
         // (e.g. defaulted) value simply disables screening instead of erroring.
         let screen_iters = self.coarse_screen_iterations.min(self.coarse_iterations);
+        // The survivor count is stated per rotation; with translation seeding
+        // it scales with the anchor count so the funnel keeps the same
+        // fraction of the (larger) hypothesis set.
+        let survivor_count = self.coarse_survivor_count.saturating_mul(anchor_count);
         let use_funnel =
-            screen_iters < self.coarse_iterations && self.coarse_survivor_count < rotations.len();
+            screen_iters < self.coarse_iterations && survivor_count < hypotheses.len();
         let mut coarse: Vec<Candidate> = if use_funnel {
-            // Screen every rotation cheaply, keep the best survivors (identity
-            // always retained), then complete only those to the full budget.
-            let screened = map_eval(&indexed, screen_iters)?;
-            let survivor_indices = select_survivor_indices(&screened, self.coarse_survivor_count);
-            let survivors: Vec<(usize, &DMatrix<f64>)> = survivor_indices
-                .iter()
-                .map(|&i| (i, &rotations[i]))
-                .collect();
+            // Screen every hypothesis cheaply, keep the best survivors (the
+            // identity/centroid hypothesis always retained), then complete
+            // only those to the full budget.
+            let screened = map_eval(&all_ids, screen_iters)?;
+            let survivors = select_survivor_indices(&screened, survivor_count);
             map_eval(&survivors, self.coarse_iterations)?
         } else {
-            map_eval(&indexed, self.coarse_iterations)?
+            map_eval(&all_ids, self.coarse_iterations)?
         };
         // Take the best `refine_count`, always keeping the identity hypothesis.
         let identity = coarse.iter().find(|c| c.index == 0).cloned();
@@ -357,6 +465,7 @@ impl PoseMarginalizedConfig {
             coefficients[..initial.coefficients.len()].copy_from_slice(&initial.coefficients);
             let config = AtlasConfig {
                 em: EmConfig {
+                    sigma2: self.initial_sigma2,
                     max_iterations: self.refine_iterations,
                     tolerance: 0.0,
                     outlier_weight: self.outlier_weight,
@@ -377,6 +486,8 @@ impl PoseMarginalizedConfig {
                 landmarks: refine_landmarks.clone(),
                 landmark_weight: self.refine_landmark_weight,
                 landmark_sigma: self.refine_landmark_sigma,
+                scale_bounds,
+                adaptive_mixing: self.adaptive_mixing,
             };
             let result =
                 AtlasRegistration::new(&refined_target, &refined_source, &refined_modes, config)?
@@ -389,6 +500,13 @@ impl PoseMarginalizedConfig {
                 result.scale,
                 &result.translation,
             );
+            // The refined mixing proportions live on the refinement
+            // subsample; lift them to the full source by nearest subsample
+            // row so the full-cloud score sees the same switched-off points.
+            let mixing_full = result.mixing_weights.as_deref().map(|pi| {
+                let lifted = lift_to_full(pi, source, &refined_source);
+                mixing_factors(Some(&lifted)).expect("lifted proportions are present")
+            });
             let score = score_candidate(
                 target,
                 &full_deformed,
@@ -397,6 +515,7 @@ impl PoseMarginalizedConfig {
                 &result.coefficients,
                 eigenvalues,
                 self.lambda_regularization,
+                mixing_full.as_deref(),
             ) + initial.prior_cost
                 + self.keypoint_penalty(
                     source,
@@ -409,12 +528,15 @@ impl PoseMarginalizedConfig {
                 );
             Ok(Candidate {
                 index: initial.index,
+                rotation_index: initial.rotation_index,
+                anchor_index: initial.anchor_index,
                 score,
                 coefficients: result.coefficients,
                 rotation: result.rotation,
                 scale: result.scale,
                 translation: result.translation,
                 prior_cost: initial.prior_cost,
+                support: 1,
             })
         };
         let mut refined: Vec<Candidate> = if self.parallel {
@@ -423,32 +545,45 @@ impl PoseMarginalizedConfig {
             coarse.iter().map(refine).collect::<Result<Vec<_>>>()?
         };
         refined.sort_by(|a, b| a.score.total_cmp(&b.score));
-        let min_score = refined[0].score;
-        let normalizer = refined
+        let hypotheses_refined = refined.len();
+        // Merge refined starts that converged to the same fit, so the
+        // posterior/entropy below is over *distinct* solutions. Without this,
+        // several starts landing in the winner's basin (strong evidence for
+        // it) would read as ambiguity.
+        let merge_radius = self.merge_tolerance * rms_radius(&refined_target);
+        let mut clusters =
+            merge_converged(refined, &refined_source, &refined_modes, merge_radius);
+        let min_score = clusters[0].score;
+        let normalizer = clusters
             .iter()
             .map(|candidate| (min_score - candidate.score).exp())
             .sum::<f64>();
-        let entropy = refined
+        let entropy = clusters
             .iter()
             .map(|candidate| {
                 let p = (min_score - candidate.score).exp() / normalizer;
                 if p > 0.0 { -p * p.ln() } else { 0.0 }
             })
             .sum::<f64>();
-        let best = refined.remove(0);
+        let distinct_hypotheses = clusters.len();
+        let score_margin = clusters
+            .get(1)
+            .map_or(f64::INFINITY, |second| second.score - min_score);
+        let best = clusters.remove(0);
         Ok(PoseMarginalizedInitialization {
             coefficients: best.coefficients,
             rotation: best.rotation,
             scale: best.scale,
             translation: best.translation,
             score: best.score,
-            score_margin: refined
-                .first()
-                .map_or(f64::INFINITY, |second| second.score - best.score),
+            score_margin,
             posterior_entropy: entropy,
             effective_hypotheses: entropy.exp(),
-            hypotheses_evaluated: rotations.len(),
-            hypotheses_refined: refined.len() + 1,
+            hypotheses_evaluated: hypotheses.len(),
+            hypotheses_refined,
+            distinct_hypotheses,
+            winner_support: best.support,
+            translation_anchors_used: anchor_count,
         })
     }
 
@@ -525,6 +660,34 @@ impl PoseMarginalizedConfig {
             || self.identity_prior_probability == 0.0
         {
             return Err(Error::InvalidOutlierWeight);
+        }
+        if self.translation_anchor_count == 0 {
+            return Err(Error::PositiveParameter("translation_anchor_count"));
+        }
+        if !self.anchor_completeness_threshold.is_finite()
+            || self.anchor_completeness_threshold <= 0.0
+        {
+            return Err(Error::PositiveParameter("anchor_completeness_threshold"));
+        }
+        if let Some((low, high)) = self.scale_bounds {
+            if !low.is_finite() || !high.is_finite() || low <= 0.0 || high < low {
+                return Err(Error::PositiveParameter("scale_bounds"));
+            }
+        }
+        if self
+            .adaptive_mixing
+            .is_some_and(|alpha| !alpha.is_finite() || alpha < 0.0)
+        {
+            return Err(Error::PositiveParameter("adaptive_mixing"));
+        }
+        if !self.merge_tolerance.is_finite() || self.merge_tolerance < 0.0 {
+            return Err(Error::PositiveParameter("merge_tolerance"));
+        }
+        if self
+            .initial_sigma2
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(Error::PositiveParameter("initial_sigma2"));
         }
         if !self.landmark_weight.is_finite() || self.landmark_weight < 0.0 {
             return Err(Error::PositiveParameter("landmark_weight"));
@@ -662,8 +825,9 @@ fn axis_angle([x, y, z]: [f64; 3], a: f64) -> DMatrix<f64> {
     let h = a / 2.;
     quaternion_matrix([x * h.sin(), y * h.sin(), z * h.sin(), h.cos()])
 }
-/// Lattice indices of the best `count` screened hypotheses, always including
-/// the identity (index 0). Mirrors the reference finalist selection.
+/// Flat hypothesis ids of the best `count` screened hypotheses, always
+/// including the identity/centroid hypothesis (id 0). Mirrors the reference
+/// finalist selection.
 fn select_survivor_indices(screened: &[Candidate], count: usize) -> Vec<usize> {
     let keep = count.clamp(1, screened.len());
     let mut order: Vec<usize> = (0..screened.len()).collect();
@@ -676,51 +840,237 @@ fn select_survivor_indices(screened: &[Candidate], count: usize) -> Vec<usize> {
     }
     survivors
 }
+/// Centroids, RMS radii and the reference scale shared by every translation
+/// seed of one search.
+struct SeedFrame {
+    source_centroid: Vec<f64>,
+    target_centroid: Vec<f64>,
+    source_radius: f64,
+    target_radius: f64,
+    /// Scale every seed starts from: the target/source RMS-radius ratio
+    /// (the classic estimate) clamped into `scale_bounds`, or exactly 1
+    /// when scale is fixed.
+    scale: f64,
+}
+
+impl SeedFrame {
+    fn new(
+        source: &DMatrix<f64>,
+        target: &DMatrix<f64>,
+        with_scale: bool,
+        scale_bounds: Option<(f64, f64)>,
+    ) -> Self {
+        let source_centroid = centroid(source);
+        let target_centroid = centroid(target);
+        let source_radius = rms_radius(source);
+        let target_radius = rms_radius(target);
+        let scale = if with_scale {
+            let ratio = target_radius / source_radius.max(f64::EPSILON);
+            match scale_bounds {
+                Some((low, high)) => ratio.clamp(low, high),
+                None => ratio,
+            }
+        } else {
+            1.0
+        };
+        Self {
+            source_centroid,
+            target_centroid,
+            source_radius,
+            target_radius,
+            scale,
+        }
+    }
+
+    /// Translation placing model point `anchor` on the target centroid under
+    /// `rotation` and the seed scale: `t = c_target − s·(anchor·R)`.
+    fn translation(&self, rotation: &DMatrix<f64>, anchor: &[f64]) -> Vec<f64> {
+        (0..3)
+            .map(|j| {
+                self.target_centroid[j]
+                    - self.scale * (0..3).map(|q| anchor[q] * rotation[(q, j)]).sum::<f64>()
+            })
+            .collect()
+    }
+
+    /// Fraction of the model the target appears to cover: its RMS radius over
+    /// the model's, measured in the seed's scale. `1` for a complete target
+    /// (or whenever a free scale absorbed the difference).
+    fn completeness(&self) -> f64 {
+        self.target_radius / (self.scale * self.source_radius).max(f64::MIN_POSITIVE)
+    }
+}
+
+fn centroid(points: &DMatrix<f64>) -> Vec<f64> {
+    (0..points.ncols())
+        .map(|j| (0..points.nrows()).map(|i| points[(i, j)]).sum::<f64>() / points.nrows() as f64)
+        .collect()
+}
+
+/// Root-mean-square distance of `points` from their centroid.
+fn rms_radius(points: &DMatrix<f64>) -> f64 {
+    let c = centroid(points);
+    ((0..points.nrows())
+        .map(|i| squared_from(points, i, &c))
+        .sum::<f64>()
+        / points.nrows().max(1) as f64)
+        .sqrt()
+}
+
+/// Translation anchors in the model frame. Anchor 0 is the model centroid.
+/// When `count > 1` and the target covers less than `threshold` of the
+/// model, farthest-point samples of the model are each replaced by the
+/// centroid of the model points around them whose RMS radius matches the
+/// target's (in model units), giving "where would a fragment of this size,
+/// located here, have its centroid". Near-duplicate anchors are dropped.
+fn translation_anchors(
+    source: &DMatrix<f64>,
+    seed: &SeedFrame,
+    count: usize,
+    threshold: f64,
+) -> Vec<Vec<f64>> {
+    let mut anchors = vec![seed.source_centroid.clone()];
+    if count <= 1 || seed.completeness() >= threshold {
+        return anchors;
+    }
+    let window_rms = seed.target_radius / seed.scale.max(f64::MIN_POSITIVE);
+    let min_separation = 0.25 * window_rms;
+    for index in subset_indices(source, Some(count - 1)) {
+        let candidate = local_centroid(source, index, window_rms);
+        let distinct = anchors.iter().all(|existing| {
+            (0..3)
+                .map(|j| (existing[j] - candidate[j]).powi(2))
+                .sum::<f64>()
+                .sqrt()
+                > min_separation
+        });
+        if distinct {
+            anchors.push(candidate);
+        }
+    }
+    anchors
+}
+
+/// Centroid of the smallest ball of model points around `center` whose RMS
+/// radius reaches `target_rms` (at least three points; the whole model if
+/// the radius is never reached).
+fn local_centroid(source: &DMatrix<f64>, center: usize, target_rms: f64) -> Vec<f64> {
+    let m = source.nrows();
+    let d = source.ncols();
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&a, &b| {
+        squared_pair(source, a, center).total_cmp(&squared_pair(source, b, center))
+    });
+    // `d` only sizes the accumulators; the loops below iterate them directly.
+    let mut sum = vec![0.0; d];
+    let mut sum_squared = 0.0;
+    let mut centroid = vec![0.0; d];
+    for (k, &index) in order.iter().enumerate() {
+        for (j, slot) in sum.iter_mut().enumerate() {
+            let value = source[(index, j)];
+            *slot += value;
+            sum_squared += value * value;
+        }
+        let n = (k + 1) as f64;
+        for (mean, &total) in centroid.iter_mut().zip(&sum) {
+            *mean = total / n;
+        }
+        let rms = (sum_squared / n - centroid.iter().map(|v| v * v).sum::<f64>())
+            .max(0.0)
+            .sqrt();
+        if k + 1 >= 3 && rms >= target_rms {
+            break;
+        }
+    }
+    centroid
+}
+
+/// Relative mixing factors `M·π_m` (floored) from proportions, or `None`.
+fn mixing_factors(pi: Option<&[f64]>) -> Option<Vec<f64>> {
+    pi.map(|values| {
+        let m = values.len() as f64;
+        values.iter().map(|&p| (p * m).max(1e-9)).collect()
+    })
+}
+
+/// Lift per-row proportions on a subsample to the full cloud by nearest
+/// subsample row, renormalized to sum to one.
+fn lift_to_full(pi: &[f64], full: &DMatrix<f64>, subsample: &DMatrix<f64>) -> Vec<f64> {
+    if subsample.nrows() == full.nrows() {
+        return pi.to_vec();
+    }
+    let mut lifted: Vec<f64> = (0..full.nrows())
+        .map(|i| {
+            let point: Vec<f64> = (0..full.ncols()).map(|j| full[(i, j)]).collect();
+            let nearest = (0..subsample.nrows())
+                .min_by(|&a, &b| {
+                    squared_from(subsample, a, &point).total_cmp(&squared_from(subsample, b, &point))
+                })
+                .unwrap_or(0);
+            pi[nearest]
+        })
+        .collect();
+    let total: f64 = lifted.iter().sum();
+    if total > 0.0 {
+        for value in &mut lifted {
+            *value /= total;
+        }
+    }
+    lifted
+}
+
+/// Merge refined candidates (sorted by score) whose fitted models agree to
+/// within `radius` (RMS over the source rows). The best-scoring member
+/// represents each cluster and carries the cluster's `support`.
+fn merge_converged(
+    refined: Vec<Candidate>,
+    source: &DMatrix<f64>,
+    modes: &DMatrix<f64>,
+    radius: f64,
+) -> Vec<Candidate> {
+    let mut clusters: Vec<Candidate> = Vec::with_capacity(refined.len());
+    let mut fits: Vec<DMatrix<f64>> = Vec::with_capacity(refined.len());
+    for candidate in refined {
+        let fit = apply_model(
+            source,
+            modes,
+            &candidate.coefficients,
+            &candidate.rotation,
+            candidate.scale,
+            &candidate.translation,
+        );
+        let existing = fits.iter().position(|other| {
+            let sum: f64 = fit
+                .iter()
+                .zip(other.iter())
+                .map(|(a, b)| (a - b).powi(2))
+                .sum();
+            (sum / fit.nrows().max(1) as f64).sqrt() <= radius
+        });
+        match existing {
+            Some(k) => clusters[k].support += 1,
+            None => {
+                clusters.push(candidate);
+                fits.push(fit);
+            }
+        }
+    }
+    clusters
+}
+
+/// Classic seed: model centroid on the target centroid, RMS-radius scale.
+/// Equivalent to `SeedFrame::translation` with the centroid anchor and no
+/// scale bounds; retained for the unit tests.
+#[cfg(test)]
 fn initial_similarity(
     source: &DMatrix<f64>,
     target: &DMatrix<f64>,
     rotation: &DMatrix<f64>,
     with_scale: bool,
 ) -> (f64, Vec<f64>) {
-    let source_centroid: Vec<_> = (0..3)
-        .map(|j| (0..source.nrows()).map(|i| source[(i, j)]).sum::<f64>() / source.nrows() as f64)
-        .collect();
-    let target_centroid: Vec<_> = (0..3)
-        .map(|j| (0..target.nrows()).map(|i| target[(i, j)]).sum::<f64>() / target.nrows() as f64)
-        .collect();
-    let scale = if with_scale {
-        let source_radius = ((0..source.nrows())
-            .map(|i| {
-                (0..3)
-                    .map(|j| (source[(i, j)] - source_centroid[j]).powi(2))
-                    .sum::<f64>()
-            })
-            .sum::<f64>()
-            / source.nrows() as f64)
-            .sqrt();
-        let target_radius = ((0..target.nrows())
-            .map(|i| {
-                (0..3)
-                    .map(|j| (target[(i, j)] - target_centroid[j]).powi(2))
-                    .sum::<f64>()
-            })
-            .sum::<f64>()
-            / target.nrows() as f64)
-            .sqrt();
-        target_radius / source_radius.max(f64::EPSILON)
-    } else {
-        1.0
-    };
-    let translation = (0..3)
-        .map(|j| {
-            target_centroid[j]
-                - scale
-                    * (0..3)
-                        .map(|q| source_centroid[q] * rotation[(q, j)])
-                        .sum::<f64>()
-        })
-        .collect();
-    (scale, translation)
+    let seed = SeedFrame::new(source, target, with_scale, None);
+    let translation = seed.translation(rotation, &seed.source_centroid);
+    (seed.scale, translation)
 }
 fn apply_model(
     s: &DMatrix<f64>,
@@ -774,6 +1124,11 @@ fn landmark_residual_sq(
         })
         .sum()
 }
+/// Dense CPD negative log-likelihood of `x` under the mixture centred at
+/// `ty`, plus the shape prior. `mixing`, when given, holds the relative
+/// per-source factors `M·π_m` (see `posterior_stats_weighted`), so the
+/// score is the likelihood of the *adaptive* mixture the EM actually fit.
+#[allow(clippy::too_many_arguments)]
 fn score_candidate(
     x: &DMatrix<f64>,
     ty: &DMatrix<f64>,
@@ -782,12 +1137,15 @@ fn score_candidate(
     b: &[f64],
     eigenvalues: &[f64],
     lambda: f64,
+    mixing: Option<&[f64]>,
 ) -> f64 {
     let (n, m, d) = (x.nrows(), ty.nrows(), x.ncols());
     let sigma2 = sigma2.max(f64::MIN_POSITIVE);
     let inorm = (1. - w).ln()
         - (m as f64).ln()
         - 0.5 * d as f64 * (2. * std::f64::consts::PI * sigma2).ln();
+    let log_mixing: Option<Vec<f64>> =
+        mixing.map(|values| values.iter().map(|&v| v.max(f64::MIN_POSITIVE).ln()).collect());
     let out = if w > 0. {
         w.ln() - (n as f64).ln()
     } else {
@@ -805,7 +1163,10 @@ fn score_candidate(
                 let delta = x[(i, q)] - ty[(j, q)];
                 distance += delta * delta;
             }
-            let value = inorm - distance * inverse_two_sigma2;
+            let mut value = inorm - distance * inverse_two_sigma2;
+            if let Some(log_mixing) = &log_mixing {
+                value += log_mixing[j];
+            }
             max_log = max_log.max(value);
             *kernel = value;
         }
@@ -1330,5 +1691,180 @@ mod landmark_pose_tests {
             guided_err < 8.0,
             "fixed-variance search should recover the basin, got {guided_err}°"
         );
+    }
+}
+
+#[cfg(test)]
+mod fragment_seeding_tests {
+    use super::{
+        Candidate, PoseMarginalizedConfig, SeedFrame, axis_angle, merge_converged,
+        translation_anchors,
+    };
+    use nalgebra::DMatrix;
+
+    /// A tapered, twisted rod: thin at x = 0, thick at x = 4. The taper makes
+    /// every segment unique, so a fragment has exactly one home.
+    fn tapered_rod(count: usize) -> DMatrix<f64> {
+        DMatrix::from_fn(count, 3, |i, j| {
+            let z = i as f64 / (count - 1) as f64;
+            let radius = 0.1 + 0.6 * z;
+            match j {
+                0 => 4.0 * z,
+                1 => radius * (7.0 * z).sin(),
+                _ => radius * (7.0 * z).cos(),
+            }
+        })
+    }
+
+    fn transform(points: &DMatrix<f64>, rotation: &DMatrix<f64>, t: &[f64]) -> DMatrix<f64> {
+        DMatrix::from_fn(points.nrows(), 3, |i, j| {
+            (0..3)
+                .map(|q| points[(i, q)] * rotation[(q, j)])
+                .sum::<f64>()
+                + t[j]
+        })
+    }
+
+    fn rms(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
+        (a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f64>()
+            / a.len() as f64)
+            .sqrt()
+    }
+
+    #[test]
+    fn anchors_collapse_to_the_centroid_for_complete_targets() {
+        let model = tapered_rod(60);
+        let seed = SeedFrame::new(&model, &model, false, None);
+        assert!((seed.completeness() - 1.0).abs() < 1e-12);
+        let anchors = translation_anchors(&model, &seed, 6, 0.9);
+        assert_eq!(anchors.len(), 1, "complete target must not be seeded");
+        // A free, unbounded scale absorbs the size difference: no seeding.
+        let fragment = DMatrix::from_fn(20, 3, |i, j| model[(i, j)]);
+        let free = SeedFrame::new(&model, &fragment, true, None);
+        assert!((free.completeness() - 1.0).abs() < 1e-12);
+        assert_eq!(translation_anchors(&model, &free, 6, 0.9).len(), 1);
+        // count = 1 never seeds.
+        let fixed = SeedFrame::new(&model, &fragment, false, None);
+        assert_eq!(translation_anchors(&model, &fixed, 1, 0.9).len(), 1);
+    }
+
+    #[test]
+    fn anchors_include_a_fragment_sized_local_centroid_near_the_true_one() {
+        let model = tapered_rod(60);
+        // Proximal third; its true centroid sits at x ≈ 0.667.
+        let fragment = DMatrix::from_fn(20, 3, |i, j| model[(i, j)]);
+        let seed = SeedFrame::new(&model, &fragment, false, None);
+        assert!(seed.completeness() < 0.5, "completeness={}", seed.completeness());
+        let anchors = translation_anchors(&model, &seed, 6, 0.9);
+        assert!(anchors.len() > 1, "fragment must produce extra anchors");
+        // Anchor 0 is the model centroid.
+        assert!((anchors[0][0] - 2.0).abs() < 1e-9);
+        let truth = super::centroid(&fragment);
+        let closest = anchors[1..]
+            .iter()
+            .map(|a| {
+                (0..3)
+                    .map(|j| (a[j] - truth[j]).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            closest < 0.25,
+            "no anchor near the fragment centroid (closest {closest}); anchors={anchors:?}"
+        );
+        // Seeding with the true anchor recovers the exact translation.
+        let identity = DMatrix::identity(3, 3);
+        let t = seed.translation(&identity, &truth);
+        assert!(t.iter().all(|v| v.abs() < 1e-9), "t={t:?}");
+        // With scale bounds the clamped scale is used for the seed.
+        let bounded = SeedFrame::new(&model, &fragment, true, Some((0.8, 1.25)));
+        assert!((bounded.scale - 0.8).abs() < 1e-12, "scale={}", bounded.scale);
+        assert!(bounded.completeness() < 0.9);
+    }
+
+    #[test]
+    fn displaced_fragment_pose_is_recovered_with_translation_seeding() {
+        let model = tapered_rod(60);
+        let modes = DMatrix::zeros(model.len(), 1);
+        let rotation = axis_angle([0.0, 0.0, 1.0], 0.3);
+        let offset = [0.5, -0.3, 0.2];
+        let fragment_model = DMatrix::from_fn(20, 3, |i, j| model[(i, j)]);
+        let target = transform(&fragment_model, &rotation, &offset);
+        // Plain seeding, then the full fragment recipe (seeding + adaptive
+        // mixing + fragment-scale starting variance).
+        for (initial_sigma2, adaptive) in [(None, None), (Some(0.2), Some(1.0))] {
+            let config = PoseMarginalizedConfig {
+                rotation_count: 9,
+                coarse_source_count: 60,
+                coarse_target_count: 20,
+                coarse_rank: 1,
+                coarse_iterations: 10,
+                refine_count: 6,
+                refine_source_count: None,
+                refine_target_count: 20,
+                refine_iterations: 30,
+                with_scale: false,
+                parallel: false,
+                translation_anchor_count: 6,
+                adaptive_mixing: adaptive,
+                initial_sigma2,
+                ..Default::default()
+            };
+            let init = config.initialize(&model, &target, &modes, &[1.0]).unwrap();
+            assert!(init.translation_anchors_used > 1, "seeding did not activate");
+            assert_eq!(
+                init.hypotheses_evaluated,
+                9 * init.translation_anchors_used
+            );
+            let posed = DMatrix::from_fn(20, 3, |i, j| {
+                init.scale
+                    * (0..3)
+                        .map(|q| model[(i, q)] * init.rotation[(q, j)])
+                        .sum::<f64>()
+                    + init.translation[j]
+            });
+            let error = rms(&posed, &target);
+            assert!(
+                error < 0.1,
+                "adaptive={adaptive:?}: fragment not placed at the thin end, rms={error}, \
+                 translation={:?}",
+                init.translation
+            );
+            assert!(init.distinct_hypotheses >= 1);
+            assert!(init.winner_support >= 1);
+            assert!(init.distinct_hypotheses <= init.hypotheses_refined);
+        }
+    }
+
+    #[test]
+    fn merging_collapses_starts_that_converged_to_the_same_fit() {
+        let model = tapered_rod(30);
+        let modes = DMatrix::zeros(model.len(), 1);
+        let make = |score: f64, angle: f64, t: [f64; 3]| Candidate {
+            index: 0,
+            rotation_index: 0,
+            anchor_index: 0,
+            score,
+            coefficients: vec![0.0],
+            rotation: axis_angle([0.0, 0.0, 1.0], angle),
+            scale: 1.0,
+            translation: t.to_vec(),
+            prior_cost: 0.0,
+            support: 1,
+        };
+        let refined = vec![
+            make(10.0, 0.0, [0.0, 0.0, 0.0]),
+            make(10.5, 1e-4, [1e-4, 0.0, 0.0]), // same fit, converged from elsewhere
+            make(40.0, 1.5, [0.7, 0.0, 0.0]),  // a genuinely different basin
+        ];
+        let clusters = merge_converged(refined, &model, &modes, 0.02);
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].support, 2);
+        assert_eq!(clusters[1].support, 1);
+        assert!((clusters[0].score - 10.0).abs() < 1e-12, "best member represents");
     }
 }
