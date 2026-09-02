@@ -131,9 +131,31 @@ was.
 ```python
 init = cpd.pose_initialize(source, target, modes, eigenvalues)
 init.rotation, init.scale, init.translation
-init.score_margin          # gap to the runner-up hypothesis
+init.score_margin          # gap to the best *different* solution
 init.effective_hypotheses  # ~1 = unambiguous; larger = near-symmetric
+init.winner_support        # refined starts that agreed on the winner
 ```
+
+**Partial targets.** Every rotation is seeded by placing the model centroid
+on the target centroid — right for a complete object, wrong for a fragment
+(the proximal third of a femur is not centred on the bone). For fragments,
+pin the scale and let the search seed translations too:
+
+```python
+init = cpd.pose_initialize(
+    source, fragment, modes, eigenvalues,
+    with_scale=False,               # or scale_bounds=(0.8, 1.25)
+    translation_anchor_count=6,     # + fragment-sized local centroids of the model
+    adaptive_mixing=1.0,            # unobserved model points switch themselves off
+    initial_sigma2=0.2,             # anneal from the fragment's scale, not the bone's
+)
+init.translation_anchors_used       # 1 when the target looked complete
+```
+
+Seeding only activates when the target is smaller than the model, so
+complete targets cost nothing extra. `register_atlas` accepts
+`scale_bounds` and `adaptive_mixing` too (`result.mixing_weights` shows
+which model points the data supported).
 
 ---
 

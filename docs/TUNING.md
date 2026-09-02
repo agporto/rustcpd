@@ -146,6 +146,41 @@ to points beyond the ones registered:
   `result.apply_similarity(z)` applies only the recovered rotation, scale,
   and translation to arbitrary points, ignoring the shape deformation.
 
+## Pose search on partial objects
+
+The default pose search seeds every rotation with the model centroid on the
+target centroid. When the target is a fragment that sits away from the
+model's centre (a proximal third, a distal end), the correct pose needs a
+translation the search never proposes, and EM has to slide there during
+annealing — which it usually does not, because at large `sigma2` the pose
+update keeps re-centring the whole model on the fragment. Symptoms: the fit
+looks fine for central fragments and "stays centred" for end fragments.
+
+The fragment recipe, in order of importance:
+
+1. **Pin the scale** — `with_scale=False` if the model is already in physical
+   units, otherwise `scale_bounds=(lo, hi)` around 1. With a free scale the
+   closed-form estimate shrinks the whole model into the fragment, and the
+   search cannot tell a fragment from a small complete object.
+2. **`translation_anchor_count=4–8`.** Adds fragment-sized local centroids of
+   the model as translation seeds ("the target is the part of the model
+   around here"). Activates only when the target's RMS radius is below
+   `anchor_completeness_threshold` (0.9) of the model's, so complete targets
+   are unchanged. Coarse cost scales with the anchors actually used; use the
+   screening funnel (`coarse_screen_iterations < coarse_iterations`,
+   `coarse_survivor_count` per rotation) to keep it cheap.
+3. **`adaptive_mixing=1.0`.** Lets model points with no data switch off, which
+   removes the centring pull and gives the fragment's distinctive points their
+   proper weight. Smaller `alpha` switches off faster; larger stays closer to
+   classic CPD.
+4. **`initial_sigma2=0.1–0.3`** (normalized frame, target RMS radius = 1).
+   Correct seeds already start close, so annealing from the fragment's own
+   scale is safe for them and more discriminating against the wrong ones.
+
+Read `translation_anchors_used` to confirm seeding activated, and
+`winner_support` / `distinct_hypotheses` to see how many refined starts
+agreed on the winner versus how many genuinely different fits survived.
+
 ## Shape completion & uncertainty (partial objects)
 
 When you register an atlas to a *partial* observation and want the missing

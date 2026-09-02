@@ -8,6 +8,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Translation seeding for partial targets** in the pose search.
+  `PoseMarginalizedConfig::translation_anchor_count` (Python
+  `translation_anchor_count`) seeds each rotation not only from the model
+  centroid but also from fragment-sized *local centroids* of the model —
+  farthest-point samples, each replaced by the centroid of the model points
+  around it whose RMS radius matches the target's — so a fragment such as the
+  proximal third of a long bone can start at the right end instead of being
+  centred on the bone. Anchor 0 is always the model centroid, and seeding
+  activates only when the target covers less than
+  `anchor_completeness_threshold` (default 0.9) of the scale-constrained
+  model, so complete targets are unaffected. Needs the scale pinned
+  (`with_scale = false` or `scale_bounds`).
+- `AtlasConfig::scale_bounds` / `PoseMarginalizedConfig::scale_bounds`
+  (`(min, max)`): clamp the starting scale and every EM scale estimate. Stops
+  the closed-form scale from shrinking the whole model into a fragment.
+- `AtlasConfig::adaptive_mixing = Some(alpha)` /
+  `PoseMarginalizedConfig::adaptive_mixing`: per-source mixing proportions
+  `π_m ∝ p1_m + alpha` re-estimated after every E-step (Dirichlet floor
+  `alpha`), so model points with no supporting data switch off instead of
+  pulling the pose toward centring. Reported as `AtlasResult::mixing_weights`
+  (Python `result.mixing_weights`) and used in the pose score. The E-step
+  gains an internal `posterior_stats_weighted` applied identically on the
+  dense, single-precision, truncated and k-NN paths.
+- `PoseMarginalizedConfig::initial_sigma2`: starting variance for the coarse
+  and refinement EM in the normalized frame, letting fragment searches anneal
+  from the fragment's own scale rather than the whole model's.
+- Pose diagnostics `distinct_hypotheses`, `winner_support` and
+  `translation_anchors_used`.
+
+### Changed
+
+- Pose `score_margin`, `posterior_entropy` and `effective_hypotheses` are now
+  computed over *distinct* refined solutions: starts that converged to the
+  same fit (RMS distance below `merge_tolerance` × target RMS radius,
+  default 0.02) are merged first. Previously several starts landing in the
+  winner's basin — evidence *for* the winner — inflated the entropy and read
+  as ambiguity.
+- Atlas registration initializes `sigma2` from the *posed* model
+  (`initial_rotation` / `initial_translation` / `initial_coefficients`
+  applied) instead of the raw mean shape. Fits that pass an initial pose far
+  from the mean's own frame now start at the right annealing level; fits
+  without an initial pose are unchanged.
+- With translation seeding active, `coarse_survivor_count` is interpreted per
+  rotation (multiplied by the number of anchors used) so the screening funnel
+  keeps the same fraction of the larger hypothesis set.
+
 ## [3.1.0] - 2026-08-18
 
 ### Added

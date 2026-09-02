@@ -850,3 +850,119 @@ def test_register_atlas_landmark_sigma_takes_precedence_over_weight():
     assert np.allclose(sigma_only.coefficients, both.coefficients, atol=1e-12)
     # and the fixed-variance branch is genuinely different from weight-only
     assert not np.allclose(sigma_only.coefficients, weight_only.coefficients, atol=1e-6)
+
+
+def tapered_rod(count=60):
+    """Thin at x=0, thick at x=4, twisted: every segment is unique."""
+    z = np.linspace(0.0, 1.0, count)
+    radius = 0.1 + 0.6 * z
+    return np.column_stack((4.0 * z, radius * np.sin(7 * z), radius * np.cos(7 * z)))
+
+
+def test_pose_initialize_seeds_translations_for_a_displaced_fragment():
+    model = tapered_rod()
+    modes = np.zeros((model.size, 1))
+    r = rotation_z(0.3)
+    offset = np.array([0.5, -0.3, 0.2])
+    target = model[:20] @ r + offset  # proximal third, displaced
+    common = dict(
+        rotation_count=9,
+        coarse_source_count=60,
+        coarse_target_count=20,
+        coarse_rank=1,
+        coarse_iterations=10,
+        refine_count=6,
+        refine_target_count=20,
+        refine_iterations=30,
+        with_scale=False,
+        parallel=False,
+    )
+    init = cpd.pose_initialize(
+        model,
+        target,
+        modes,
+        [1.0],
+        translation_anchor_count=6,
+        adaptive_mixing=1.0,
+        initial_sigma2=0.2,
+        **common,
+    )
+    assert init.translation_anchors_used > 1
+    assert init.hypotheses_evaluated == 9 * init.translation_anchors_used
+    assert 1 <= init.distinct_hypotheses <= init.hypotheses_refined
+    assert init.winner_support >= 1
+    posed = init.scale * (model[:20] @ init.rotation) + init.translation
+    assert rms(posed, target) < 0.1
+
+    # A complete target never seeds, whatever the anchor count.
+    full = cpd.pose_initialize(
+        model,
+        model @ r + offset,
+        modes,
+        [1.0],
+        translation_anchor_count=6,
+        **{**common, "coarse_target_count": 60, "refine_target_count": 60},
+    )
+    assert full.translation_anchors_used == 1
+    assert full.hypotheses_evaluated == 9
+
+    # The compatibility wrapper forwards the new options.
+    wrapped = cpd.pose_marginalized_initialization(
+        model,
+        target,
+        modes,
+        [1.0],
+        translation_anchor_count=6,
+        with_scale=False,
+        rotation_count=9,
+        coarse_source_count=60,
+        coarse_target_count=20,
+        coarse_rank=1,
+        coarse_iterations=10,
+        refine_count=6,
+        refine_target_count=20,
+        refine_iterations=30,
+    )
+    assert wrapped.translation_anchors_used > 1
+
+
+def test_register_atlas_adaptive_mixing_and_scale_bounds():
+    model = tapered_rod()
+    modes = np.zeros((model.size, 1))
+    target = model[:20]  # fragment already in place
+    plain = cpd.register_atlas(
+        target, model, modes, [1.0], optimize_similarity=False, max_iterations=15, tolerance=0.0
+    )
+    assert plain.mixing_weights is None
+    adaptive = cpd.register_atlas(
+        target,
+        model,
+        modes,
+        [1.0],
+        optimize_similarity=False,
+        adaptive_mixing=0.01,
+        outlier_weight=0.05,
+        max_iterations=15,
+        tolerance=0.0,
+    )
+    pi = adaptive.mixing_weights
+    assert pi.shape == (60,)
+    assert abs(pi.sum() - 1.0) < 1e-9
+    assert pi[:20].sum() > 0.9 and pi[20:].sum() < 0.1
+
+    bounded = cpd.register_atlas(
+        model[40:],
+        model,
+        modes,
+        [1.0],
+        with_scale=True,
+        initial_scale=0.3,
+        scale_bounds=(0.9, 1.1),
+        max_iterations=30,
+        tolerance=0.0,
+    )
+    assert 0.9 <= bounded.scale <= 1.1
+    with pytest.raises(ValueError):
+        cpd.register_atlas(target, model, modes, [1.0], scale_bounds=(1.2, 0.8))
+    with pytest.raises(ValueError):
+        cpd.register_atlas(target, model, modes, [1.0], adaptive_mixing=-1.0)

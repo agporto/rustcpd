@@ -271,6 +271,12 @@ pub struct AtlasResult {
     /// floor.
     #[pyo3(get)]
     pub landmark_rms: f64,
+    /// Final per-source mixing proportions (shape `(M,)`, summing to 1) when
+    /// `adaptive_mixing` was set; `None` for classic uniform mixing. Small
+    /// values mark model points the target did not support (for a partial
+    /// target, the unobserved part of the model).
+    #[pyo3(get)]
+    pub mixing_weights: Option<Py<PyArray1<f64>>>,
     // Retained in native form for reconstruct / apply_similarity.
     coefficients_vec: Vec<f64>,
     rotation_matrix: DMatrix<f64>,
@@ -460,6 +466,7 @@ impl AtlasResult {
             difference: self.difference,
             negative_log_likelihood: f64::INFINITY,
             landmark_rms: f64::NAN,
+            mixing_weights: None,
         }
     }
 }
@@ -499,9 +506,20 @@ pub struct PoseInitialization {
     /// Rotation hypotheses evaluated in the coarse pass.
     #[pyo3(get)]
     pub hypotheses_evaluated: usize,
-    /// Hypotheses carried through refinement.
+    /// Hypotheses carried through refinement (before merging).
     #[pyo3(get)]
     pub hypotheses_refined: usize,
+    /// Distinct solutions among the refined hypotheses after merging starts
+    /// that converged to the same fit (`merge_tolerance`).
+    #[pyo3(get)]
+    pub distinct_hypotheses: usize,
+    /// Refined starts that converged to the winning solution. Several starts
+    /// agreeing is evidence *for* the winner, not ambiguity.
+    #[pyo3(get)]
+    pub winner_support: usize,
+    /// Translation anchors actually used per rotation (1 = centroid only).
+    #[pyo3(get)]
+    pub translation_anchors_used: usize,
 }
 
 /// Rigid (rotation + translation + optional scale) registration of the
@@ -806,6 +824,13 @@ fn register_deformable(
 ///
 /// `modes` has shape `(M*D, rank)` with rows in point-major order and
 /// `eigenvalues` one positive value per mode.
+///
+/// For **partial targets** (the target is a fragment of the model) see
+/// `scale_bounds` — a `(min, max)` interval that stops the closed-form
+/// scale from shrinking the whole model into the fragment — and
+/// `adaptive_mixing=alpha`, which re-estimates per-model-point mixing
+/// proportions so points with no supporting data switch off (reported as
+/// `result.mixing_weights`).
 #[pyfunction]
 #[pyo3(signature = (target, mean, modes, eigenvalues, *,
     lambda_regularization = 0.1, normalize = false,
@@ -814,7 +839,7 @@ fn register_deformable(
     initial_coefficients = None, initial_rotation = None,
     initial_scale = 1.0, initial_translation = None, sigma2 = None,
     landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
-    landmark_sigma = None,
+    landmark_sigma = None, scale_bounds = None, adaptive_mixing = None,
     max_iterations = 100, tolerance = 1e-3, outlier_weight = 0.0,
     k = None, parallel = true, single_precision = false))]
 #[allow(clippy::too_many_arguments)]
@@ -838,6 +863,8 @@ fn register_atlas(
     landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
     landmark_weight: f64,
     landmark_sigma: Option<f64>,
+    scale_bounds: Option<(f64, f64)>,
+    adaptive_mixing: Option<f64>,
     max_iterations: usize,
     tolerance: f64,
     outlier_weight: f64,
@@ -892,6 +919,8 @@ fn register_atlas(
         landmarks,
         landmark_weight,
         landmark_sigma,
+        scale_bounds,
+        adaptive_mixing,
     };
     let result = py
         .detach(|| cpd::AtlasRegistration::new(&x, &mean, &modes, config)?.register())
@@ -906,6 +935,7 @@ fn register_atlas(
         iterations: result.iterations,
         difference: result.difference,
         landmark_rms: result.landmark_rms,
+        mixing_weights: result.mixing_weights.as_deref().map(|pi| vector_to(py, pi)),
         coefficients_vec: result.coefficients,
         rotation_matrix: result.rotation,
         translation_vec: result.translation,
@@ -919,6 +949,19 @@ fn register_atlas(
 /// Set `with_scale=False` when `source` and `modes` were already pre-scaled
 /// from an external physical-size estimate. Rotation and translation remain
 /// optimized, while the residual isotropic scale is fixed at 1.0.
+///
+/// **Partial targets.** By default every rotation is seeded by placing the
+/// model centroid on the target centroid, which is wrong for a fragment
+/// (the proximal third of a femur is not centred on the bone). Set
+/// `translation_anchor_count > 1` to also seed fragment-sized local
+/// centroids of the model as translation anchors; this needs the scale
+/// pinned down (`with_scale=False` or `scale_bounds=(lo, hi)`) and only
+/// activates when the target is smaller than `anchor_completeness_threshold`
+/// of the model, so complete targets are unaffected. `adaptive_mixing=alpha`
+/// lets unobserved model points switch off, and `initial_sigma2` (in the
+/// normalized frame, target RMS radius = 1; try 0.1-0.3) starts the annealing
+/// at the fragment's own scale. `merge_tolerance` merges refined starts that
+/// converged to the same fit before the ambiguity diagnostics are computed.
 #[pyfunction]
 #[pyo3(signature = (source, target, modes, eigenvalues, *,
     rotation_count = 193, coarse_source_count = 400,
@@ -933,6 +976,9 @@ fn register_atlas(
     landmark_sigma = None,
     refine_landmark_weight = 0.0, refine_landmark_sigma = None,
     with_scale = true,
+    translation_anchor_count = 1, anchor_completeness_threshold = 0.9,
+    scale_bounds = None, adaptive_mixing = None, merge_tolerance = 0.02,
+    initial_sigma2 = None,
     seed = 0, parallel = true,
     single_precision = false))]
 #[allow(clippy::too_many_arguments)]
@@ -964,6 +1010,12 @@ fn pose_initialize(
     refine_landmark_weight: f64,
     refine_landmark_sigma: Option<f64>,
     with_scale: bool,
+    translation_anchor_count: usize,
+    anchor_completeness_threshold: f64,
+    scale_bounds: Option<(f64, f64)>,
+    adaptive_mixing: Option<f64>,
+    merge_tolerance: f64,
+    initial_sigma2: Option<f64>,
     seed: u64,
     parallel: bool,
     single_precision: bool,
@@ -1026,6 +1078,12 @@ fn pose_initialize(
         seed,
         parallel,
         single_precision,
+        translation_anchor_count,
+        anchor_completeness_threshold,
+        scale_bounds,
+        adaptive_mixing,
+        merge_tolerance,
+        initial_sigma2,
     };
     let result = py
         .detach(|| config.initialize(&source, &target, &modes, &eigenvalues))
@@ -1041,6 +1099,9 @@ fn pose_initialize(
         effective_hypotheses: result.effective_hypotheses,
         hypotheses_evaluated: result.hypotheses_evaluated,
         hypotheses_refined: result.hypotheses_refined,
+        distinct_hypotheses: result.distinct_hypotheses,
+        winner_support: result.winner_support,
+        translation_anchors_used: result.translation_anchors_used,
     })
 }
 

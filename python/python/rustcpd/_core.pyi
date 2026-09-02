@@ -55,6 +55,9 @@ class AtlasResult:
     # landmarks. Noise floor is sqrt(D)*tau (sqrt(3)*tau in 3D); normalized
     # discrepancy (landmark_rms/(sqrt(D)*tau))**2 is ~1 at the noise floor.
     landmark_rms: float
+    # Per-source mixing proportions (sum to 1) when adaptive_mixing was set;
+    # None for classic uniform mixing.
+    mixing_weights: NDArray[np.float64] | None
     def reconstruct(
         self, mean: _ArrayLike, modes: _ArrayLike
     ) -> NDArray[np.float64]: ...
@@ -89,6 +92,12 @@ class PoseInitialization:
     effective_hypotheses: float
     hypotheses_evaluated: int
     hypotheses_refined: int
+    # Distinct solutions after merging refined starts that converged to the
+    # same fit, how many starts backed the winner, and the translation anchors
+    # actually seeded per rotation (1 = centroid only).
+    distinct_hypotheses: int
+    winner_support: int
+    translation_anchors_used: int
 
 class Correspondences:
     matches: NDArray[np.int64]
@@ -201,6 +210,8 @@ def register_atlas(
     landmark_targets: _ArrayLike | None = ...,
     landmark_weight: float = ...,
     landmark_sigma: float | None = ...,
+    scale_bounds: tuple[float, float] | None = ...,
+    adaptive_mixing: float | None = ...,
     max_iterations: int = ...,
     tolerance: float = ...,
     outlier_weight: float = ...,
@@ -236,6 +247,12 @@ def pose_initialize(
     refine_landmark_weight: float = ...,
     refine_landmark_sigma: float | None = ...,
     with_scale: bool = ...,
+    translation_anchor_count: int = ...,
+    anchor_completeness_threshold: float = ...,
+    scale_bounds: tuple[float, float] | None = ...,
+    adaptive_mixing: float | None = ...,
+    merge_tolerance: float = ...,
+    initial_sigma2: float | None = ...,
     seed: int = ...,
     parallel: bool = ...,
     single_precision: bool = ...,
