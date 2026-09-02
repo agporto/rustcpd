@@ -1385,7 +1385,8 @@ mod tests {
 
         // A vector of ones is exactly classic CPD.
         let ones = vec![1.0; count];
-        let unit = posterior_stats_dense(&x, &ty, sigma2, outlier_weight, false, false, Some(&ones));
+        let unit =
+            posterior_stats_dense(&x, &ty, sigma2, outlier_weight, false, false, Some(&ones));
         assert_slice_close(&unit.p1, &uniform.p1, 1e-15, "p1 (unit weights)");
     }
 }

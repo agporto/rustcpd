@@ -500,7 +500,10 @@ impl<'a> AtlasRegistration<'a> {
         // Adaptive mixing: `pi` are the proportions (sum to 1), `mixing`
         // the relative factors `M·pi` the E-step consumes. Both start
         // uniform, so the first E-step is exactly classic CPD.
-        let mut pi: Option<Vec<f64>> = self.config.adaptive_mixing.map(|_| vec![1.0 / m as f64; m]);
+        let mut pi: Option<Vec<f64>> = self
+            .config
+            .adaptive_mixing
+            .map(|_| vec![1.0 / m as f64; m]);
         let mut mixing: Option<Vec<f64>> = pi.as_ref().map(|_| vec![1.0; m]);
         while iterations < self.config.em.max_iterations && diff > self.config.em.tolerance {
             if !sparse_active && sparse_threshold.is_some_and(|threshold| sigma2 < threshold) {

@@ -1004,7 +1004,8 @@ fn lift_to_full(pi: &[f64], full: &DMatrix<f64>, subsample: &DMatrix<f64>) -> Ve
             let point: Vec<f64> = (0..full.ncols()).map(|j| full[(i, j)]).collect();
             let nearest = (0..subsample.nrows())
                 .min_by(|&a, &b| {
-                    squared_from(subsample, a, &point).total_cmp(&squared_from(subsample, b, &point))
+                    squared_from(subsample, a, &point)
+                        .total_cmp(&squared_from(subsample, b, &point))
                 })
                 .unwrap_or(0);
             pi[nearest]
@@ -1816,10 +1817,7 @@ mod fragment_seeding_tests {
             };
             let init = config.initialize(&model, &target, &modes, &[1.0]).unwrap();
             assert!(init.translation_anchors_used > 1, "seeding did not activate");
-            assert_eq!(
-                init.hypotheses_evaluated,
-                9 * init.translation_anchors_used
-            );
+            assert_eq!(init.hypotheses_evaluated, 9 * init.translation_anchors_used);
             let posed = DMatrix::from_fn(20, 3, |i, j| {
                 init.scale
                     * (0..3)
