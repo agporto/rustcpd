@@ -184,7 +184,40 @@ The fragment recipe, in order of importance:
 
 Read `translation_anchors_used` to confirm seeding activated, and
 `winner_support` / `distinct_hypotheses` to see how many refined starts
-agreed on the winner versus how many genuinely different fits survived.
+agreed on the winner versus how many different fits survived. These summarize
+the explored solutions; they do not certify that the correct pose was searched.
+
+### Continuing between stages
+
+The pose funnel resumes screened survivors for the remaining coarse budget,
+then transfers their variance and mixture into refinement. The
+`initial_sigma2` option applies only to the first coarse pass. The fitted models
+are clustered using `merge_tolerance` before both pruning steps, so duplicate
+starts do not fill the refinement budget. `refine_count` is a maximum; fewer
+fits run if fewer distinct solutions survive. Set `merge_tolerance=0` to disable
+clustering. The identity basin is retained when the budget has room for more
+than one fit, even if a different start represents that basin.
+
+For the final atlas registration, use `initial_state=init.state` (or
+`initial_state=fit.state` when resuming an atlas fit). In Rust, use
+`AtlasConfig { initial_state: Some(init.state()), ..config }`. The state carries
+pose, shape, variance in original target units, mixture weights, and background
+density. Variance and outlier odds are converted automatically when normalization
+or target sample count changes. New shape modes start at zero. Mean coordinates
+are retained with the weights, allowing transfer to a reordered or denser
+sampling without assuming that equal point counts mean equal vertex order.
+
+Keep `with_scale`, `scale_bounds`, `adaptive_mixing`, `outlier_weight`,
+`lambda_regularization`, and any landmark constraints consistent across calls.
+These settings belong to the receiving config, not to the state. Without
+`adaptive_mixing`, a saved nonuniform mixture stays active with fixed weights.
+An explicit `sigma2` overrides the saved variance in the receiving **working**
+frame; individual pose initializers and `initial_state` are mutually exclusive.
+
+Mixture transfer interpolates relative occupancies by nearest mean vertex and
+renormalizes on the destination. It assumes comparable sampling density and is
+not a surface-area correction. Coarse/refinement maps are built once and shared
+across hypotheses.
 
 ## Shape completion & uncertainty (partial objects)
 
@@ -193,6 +226,14 @@ region filled in with a confidence estimate, build a posterior from the fit
 (`AtlasResult.posterior` / `.posterior`; Rust needs the `completion`
 feature). Notes on the knobs:
 
+- **Observation model** — completion conditions on the fitted `sigma2` and
+  mixing weights; it does not run a new variance annealing loop. The fitted
+  outlier density is preserved in original target units. `outlier_weight=None`
+  inherits the registration's outlier weight, and an explicit value overrides
+  it (`0.0` requests clean assignments). Rust uses `Option<f64>` for this
+  override. Adaptive weights also transfer to a denser completion mean using
+  the same occupancy interpolation as registration continuation.
+
 - **`completeness`** — roughly what fraction of the object was observed, in
   `(0, 1]`. Visibility is inferred from the fitted correspondence: the
   highest-mass `completeness` fraction of model points is treated as
@@ -200,11 +241,12 @@ feature). Notes on the knobs:
   scalar — and it separates "genuinely unobserved" from "observed but
   poorly fit" better than a fixed threshold. Omit it to fall back to a
   weight floor (`visibility_floor`).
-- **`prior_temperature`** — the atlas `lambda_regularization` is a prior
-  *temperature*; completion uses the statistically correct prior
+- **`prior_temperature`** — this legacy name denotes a prior **precision
+  multiplier**, matching atlas `lambda_regularization`; completion uses the original prior
   (`temperature = 1`) by default. Set it equal to the `lambda_regularization`
-  you fit with if you need the completion's point estimate to reproduce the
-  fitted coefficients exactly.
+  you fit with to retain the same shape-prior strength. Exact coefficient
+  agreement additionally requires a converged fit and the same conditioning
+  information; visibility truncation or omitted landmark terms can change it.
 - **Confidence is coefficient-space, not per-point-independent.** A rank-`k`
   model has only `k` degrees of freedom, so once the fragment pins the
   coefficients, *all* points — observed and missing — are similarly

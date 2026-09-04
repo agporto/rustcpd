@@ -132,7 +132,7 @@ was.
 init = cpd.pose_initialize(source, target, modes, eigenvalues)
 init.rotation, init.scale, init.translation
 init.score_margin          # gap to the best *different* solution
-init.effective_hypotheses  # ~1 = unambiguous; larger = near-symmetric
+init.effective_hypotheses  # score concentration among the solutions explored
 init.winner_support        # refined starts that agreed on the winner
 ```
 
@@ -142,13 +142,28 @@ on the target centroid — right for a complete object, wrong for a fragment
 pin the scale and let the search seed translations too:
 
 ```python
+common = dict(
+    with_scale=False,               # or with_scale=True, scale_bounds=(0.8, 1.25)
+    adaptive_mixing=1.0,            # optional occupancy adaptation
+    outlier_weight=0.05,
+    lambda_regularization=0.1,
+)
 init = cpd.pose_initialize(
     source, fragment, modes, eigenvalues,
-    with_scale=False,               # or scale_bounds=(0.8, 1.25)
     translation_anchor_count=6,     # + fragment-sized local centroids of the model
-    adaptive_mixing=1.0,            # optional: unobserved model points switch off
+    **common,
 )
 init.translation_anchors_used       # 1 when the target looked complete
+
+# Continue the fitted pose, coefficients, variance AND mixture.
+fit = cpd.register_atlas(
+    fragment, source, modes, eigenvalues,
+    initial_state=init.state, normalize=True, **common,
+)
+post = fit.posterior(
+    fragment, source, modes, eigenvalues,
+    prior_temperature=common["lambda_regularization"],
+)
 ```
 
 Seeding only activates when the target is smaller than the model, so
@@ -159,6 +174,30 @@ seeds themselves, is what decides whether the fragment lands at the right
 end. `register_atlas` accepts
 `scale_bounds` and `adaptive_mixing` too (`result.mixing_weights` shows
 which model points the data supported).
+
+Screened survivors continue for the remaining coarse iterations. Near-duplicate
+fits are merged before the screening and refinement budgets are applied; the
+refinement then continues their fitted variance and mixture. `initial_sigma2`
+sets the **first** coarse variance, not a restart value for every stage.
+
+`init.state` and `fit.state` are `AtlasState` snapshots. Their variance is in
+squared original target-coordinate units and is converted automatically by
+`register_atlas(initial_state=...)`. Keep the model/EM settings in `common`
+consistent between calls. Passing `sigma2` explicitly overrides the saved
+variance in the receiving fit's working frame; individual pose initializers
+cannot be combined with `initial_state`. Additional shape modes start at zero.
+If `adaptive_mixing` is omitted on continuation, saved mixing weights remain
+active but are held fixed.
+
+Completion inherits the fitted variance, mixture, and outlier model. An explicit
+`posterior(outlier_weight=0.0)` disables the outlier component; the default `None`
+inherits the fit's value. Occupancies are transferred to another sampling of the
+same mean by nearest-neighbor interpolation in model coordinates and
+renormalization. This supports reordering and denser meshes, assuming comparable
+surface sampling. It does not correct for unequal surface-area sampling.
+
+The pose diagnostics describe agreement among searched solutions; they are not
+calibrated probabilities of anatomical correctness.
 
 ---
 

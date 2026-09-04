@@ -42,6 +42,25 @@ class DeformableResult:
     difference: float
     def transform(self, z: _ArrayLike) -> NDArray[np.float64]: ...
 
+class AtlasState:
+    """Snapshot for register_atlas(initial_state=...). Values use original units."""
+    @property
+    def coefficients(self) -> NDArray[np.float64]: ...
+    @property
+    def rotation(self) -> NDArray[np.float64]: ...
+    @property
+    def scale(self) -> float: ...
+    @property
+    def translation(self) -> NDArray[np.float64]: ...
+    @property
+    def sigma2(self) -> float: ...
+    @property
+    def outlier_density(self) -> float: ...
+    @property
+    def mixing_weights(self) -> NDArray[np.float64] | None: ...
+    @property
+    def mixing_reference(self) -> NDArray[np.float64] | None: ...
+
 class AtlasResult:
     points: NDArray[np.float64]
     coefficients: NDArray[np.float64]
@@ -58,6 +77,9 @@ class AtlasResult:
     # Per-source mixing proportions (sum to 1) when adaptive_mixing was set;
     # None for classic uniform mixing.
     mixing_weights: NDArray[np.float64] | None
+    outlier_weight: float
+    @property
+    def state(self) -> AtlasState: ...
     def reconstruct(
         self, mean: _ArrayLike, modes: _ArrayLike
     ) -> NDArray[np.float64]: ...
@@ -72,7 +94,7 @@ class AtlasResult:
         completeness: float | None = ...,
         visibility_floor: float = ...,
         prior_temperature: float = ...,
-        outlier_weight: float = ...,
+        outlier_weight: float | None = ...,
         estimate_discrepancy: bool = ...,
     ) -> ShapePosterior: ...
 
@@ -81,6 +103,10 @@ class PoseInitialization:
     rotation: NDArray[np.float64]
     scale: float
     translation: NDArray[np.float64]
+    sigma2: float
+    mixing_weights: NDArray[np.float64] | None
+    @property
+    def state(self) -> AtlasState: ...
     # Unnormalized negative-log-posterior of the winner: ranks hypotheses only
     # within a single run (includes the keypoint penalty when landmarks are set).
     # Not comparable across runs, keypoint counts, or landmark_sigma values. Use
@@ -205,6 +231,7 @@ def register_atlas(
     initial_rotation: _ArrayLike | None = ...,
     initial_scale: float = ...,
     initial_translation: Sequence[float] | None = ...,
+    initial_state: AtlasState | None = ...,
     sigma2: float | None = ...,
     landmark_indices: Sequence[int] | None = ...,
     landmark_targets: _ArrayLike | None = ...,

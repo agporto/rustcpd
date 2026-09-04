@@ -1,8 +1,9 @@
 use nalgebra::DMatrix;
 use rayon::prelude::*;
 
+use crate::atlas_state::{MixingWeightMap, mixing_factors};
 use crate::fastexp::exp_non_positive;
-use crate::{AtlasConfig, AtlasRegistration, EmConfig, Error, Result};
+use crate::{AtlasConfig, AtlasRegistration, AtlasState, EmConfig, Error, Result};
 
 /// Coarse-stage scoring for pose screening.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,7 +46,8 @@ pub struct PoseMarginalizedConfig {
     pub coarse_survivor_count: usize,
     /// Coarse-stage scoring mode used to rank screened / coarse hypotheses.
     pub coarse_score_mode: PoseScoreMode,
-    /// Number of best coarse hypotheses carried into refinement.
+    /// Maximum number of distinct coarse fits carried into refinement.
+    /// Near-duplicates are merged before applying this budget.
     pub refine_count: usize,
     /// Source subsample size for refinement (`None` uses every point).
     pub refine_source_count: Option<usize>,
@@ -145,13 +147,15 @@ pub struct PoseMarginalizedConfig {
     /// centering bias for partial targets. The refined proportions also enter
     /// the final full-cloud score. `None` (default) is classic CPD.
     pub adaptive_mixing: Option<f64>,
-    /// Refined hypotheses whose fitted models differ by an RMS distance below
+    /// At each pruning stage and after refinement, hypotheses whose fitted
+    /// models differ by an RMS distance below
     /// `merge_tolerance × RMS-radius(target)` are treated as the same solution
     /// when computing [`PoseMarginalizedInitialization::score_margin`],
-    /// `posterior_entropy`, `effective_hypotheses` and `distinct_hypotheses`.
+    /// `posterior_entropy`, `effective_hypotheses` and `distinct_hypotheses`,
+    /// and before applying the screening/refinement candidate budgets.
     /// Default `0.02`. `0` disables merging.
     pub merge_tolerance: f64,
-    /// Starting variance for every coarse and refinement EM, in the
+    /// Starting variance for the first coarse EM, in the
     /// normalized frame the atlas runs in (target centred, RMS radius 1).
     ///
     /// `None` (default) uses the classic pairwise estimate from the posed
@@ -159,11 +163,11 @@ pub struct PoseMarginalizedConfig {
     /// [`FRAGMENT_INITIAL_SIGMA2`] is used. The classic estimate is dominated
     /// by the *whole model's* extent; for a fragment it starts the annealing
     /// so soft that the first M-steps re-centre the model on the fragment
-    /// before any seed can take hold (this alone, not the seeds, decided the
+    /// before any seed can take hold (this interaction decided the
     /// outcome in testing). Seeded hypotheses already start close, so a
     /// variance on the fragment's own scale is safe for the right ones and
     /// more discriminating against the wrong ones. Set `Some(v)` to override
-    /// in either case.
+    /// in either case. Later stages continue the fitted variance.
     pub initial_sigma2: Option<f64>,
 }
 
@@ -216,6 +220,15 @@ pub struct PoseMarginalizedInitialization {
     pub scale: f64,
     /// Translation of the winning hypothesis.
     pub translation: Vec<f64>,
+    /// Fitted variance in squared original target-coordinate units.
+    pub sigma2: f64,
+    /// Uniform background density in original target coordinates.
+    pub outlier_density: f64,
+    /// Mixture probabilities on the full input source, when adaptive mixing
+    /// was enabled. Included in [`Self::state`] for subsequent registration.
+    pub mixing_weights: Option<Vec<f64>>,
+    /// Original source mean vertices corresponding to `mixing_weights`.
+    pub mixing_reference: Option<DMatrix<f64>>,
     /// Negative-log-posterior score of the winner (lower is better). This is an
     /// unnormalized comparative quantity — it only ranks hypotheses *within a
     /// single run*, and includes the keypoint penalty when landmarks are set.
@@ -243,10 +256,28 @@ pub struct PoseMarginalizedInitialization {
     /// Distinct solutions among the refined hypotheses after merging.
     pub distinct_hypotheses: usize,
     /// Refined starts that converged to the winning solution. Several starts
-    /// agreeing is *evidence for* the winner, not ambiguity.
+    /// agreeing measures search agreement, not calibrated pose confidence.
     pub winner_support: usize,
     /// Translation anchors actually used per rotation (1 = centroid only).
     pub translation_anchors_used: usize,
+}
+
+impl PoseMarginalizedInitialization {
+    /// Capture the complete fitted state for `AtlasConfig::initial_state`.
+    /// Keep the receiving config's scale constraints, regularization, outlier
+    /// weight and adaptive-mixing strength consistent with the pose search.
+    pub fn state(&self) -> AtlasState {
+        AtlasState {
+            coefficients: self.coefficients.clone(),
+            rotation: self.rotation.clone(),
+            scale: self.scale,
+            translation: self.translation.clone(),
+            sigma2: self.sigma2,
+            outlier_density: self.outlier_density,
+            mixing_weights: self.mixing_weights.clone(),
+            mixing_reference: self.mixing_reference.clone(),
+        }
+    }
 }
 
 /// Default starting variance (normalized frame, target RMS radius = 1) for
@@ -272,9 +303,29 @@ struct Candidate {
     rotation: DMatrix<f64>,
     scale: f64,
     translation: Vec<f64>,
+    sigma2: f64,
+    outlier_density: f64,
+    mixing_weights: Option<Vec<f64>>,
     prior_cost: f64,
     /// Number of refined starts merged into this candidate.
     support: usize,
+    /// Preserve the identity basin even if another start represents it.
+    contains_identity: bool,
+}
+
+impl Candidate {
+    fn state(&self, source: &DMatrix<f64>) -> AtlasState {
+        AtlasState {
+            coefficients: self.coefficients.clone(),
+            rotation: self.rotation.clone(),
+            scale: self.scale,
+            translation: self.translation.clone(),
+            sigma2: self.sigma2,
+            outlier_density: self.outlier_density,
+            mixing_weights: self.mixing_weights.clone(),
+            mixing_reference: self.mixing_weights.as_ref().map(|_| source.clone()),
+        }
+    }
 }
 
 impl PoseMarginalizedConfig {
@@ -330,96 +381,109 @@ impl PoseMarginalizedConfig {
             .collect();
         // Evaluate one hypothesis: run `max_iters` of coarse atlas EM from
         // its initial similarity and score it under the configured mode.
-        let evaluate = |id: usize, max_iters: usize| -> Result<Candidate> {
-            let (rotation_index, anchor_index) = hypotheses[id];
-            let rotation = &rotations[rotation_index];
-            let prior = if rotation_index == 0 {
-                self.identity_prior_probability
-            } else {
-                nonidentity_prior
-            };
-            let translation = seed.translation(rotation, &anchors[anchor_index]);
-            let config = AtlasConfig {
-                em: EmConfig {
-                    sigma2: initial_sigma2,
-                    max_iterations: max_iters,
-                    tolerance: 0.0,
-                    outlier_weight: self.outlier_weight,
-                    parallel: false,
-                    single_precision: self.single_precision,
+        let evaluate =
+            |id: usize, max_iters: usize, initial: Option<&Candidate>| -> Result<Candidate> {
+                let (rotation_index, anchor_index) = hypotheses[id];
+                let rotation = &rotations[rotation_index];
+                let prior = if rotation_index == 0 {
+                    self.identity_prior_probability
+                } else {
+                    nonidentity_prior
+                };
+                let translation = seed.translation(rotation, &anchors[anchor_index]);
+                let config = AtlasConfig {
+                    em: EmConfig {
+                        sigma2: if initial.is_none() {
+                            initial_sigma2
+                        } else {
+                            None
+                        },
+                        max_iterations: max_iters,
+                        tolerance: 0.0,
+                        outlier_weight: self.outlier_weight,
+                        parallel: false,
+                        single_precision: self.single_precision,
+                        ..Default::default()
+                    },
+                    eigenvalues: eigenvalues[..rank].to_vec(),
+                    lambda_regularization: self.lambda_regularization,
+                    normalize: true,
+                    optimize_similarity: true,
+                    with_scale: self.with_scale,
+                    initial_rotation: initial.is_none().then(|| rotation.clone()),
+                    initial_scale: if initial.is_none() { seed.scale } else { 1.0 },
+                    initial_translation: initial.is_none().then_some(translation),
+                    initial_state: initial.map(|c| c.state(&coarse_source)),
+                    scale_bounds,
+                    adaptive_mixing: self.adaptive_mixing,
                     ..Default::default()
-                },
-                eigenvalues: eigenvalues[..rank].to_vec(),
-                lambda_regularization: self.lambda_regularization,
-                normalize: true,
-                optimize_similarity: true,
-                with_scale: self.with_scale,
-                initial_rotation: Some(rotation.clone()),
-                initial_scale: seed.scale,
-                initial_translation: Some(translation),
-                scale_bounds,
-                adaptive_mixing: self.adaptive_mixing,
-                ..Default::default()
-            };
-            let result =
-                AtlasRegistration::new(&coarse_target, &coarse_source, &coarse_modes, config)?
-                    .register()?;
-            let mixing = mixing_factors(result.mixing_weights.as_deref());
-            let data_cost = match self.coarse_score_mode {
-                // score_candidate already folds in the shape-prior term.
-                PoseScoreMode::Final => score_candidate(
-                    &coarse_target,
-                    &result.points,
-                    result.sigma2,
-                    self.outlier_weight,
+                };
+                let result =
+                    AtlasRegistration::new(&coarse_target, &coarse_source, &coarse_modes, config)?
+                        .register()?;
+                let mixing = mixing_factors(result.mixing_weights.as_deref());
+                let data_cost = match self.coarse_score_mode {
+                    // score_candidate already folds in the shape-prior term.
+                    PoseScoreMode::Final => score_candidate(
+                        &coarse_target,
+                        &result.points,
+                        result.sigma2,
+                        self.outlier_weight,
+                        result.outlier_density,
+                        &result.coefficients,
+                        &eigenvalues[..rank],
+                        self.lambda_regularization,
+                        mixing.as_deref(),
+                    ),
+                    // Running EM data objective plus the shape prior, matching the
+                    // reference "trajectory" score. Comparable across hypotheses
+                    // because every candidate shares the same normalized target.
+                    PoseScoreMode::Trajectory => {
+                        let shape_cost = 0.5
+                            * self.lambda_regularization
+                            * result
+                                .coefficients
+                                .iter()
+                                .zip(&eigenvalues[..rank])
+                                .map(|(b, e)| b * b / e.max(f64::EPSILON))
+                                .sum::<f64>();
+                        result.negative_log_likelihood + shape_cost
+                    }
+                };
+                let kp_penalty = self.keypoint_penalty(
+                    source,
+                    modes,
                     &result.coefficients,
-                    &eigenvalues[..rank],
-                    self.lambda_regularization,
-                    mixing.as_deref(),
-                ),
-                // Running EM data objective plus the shape prior, matching the
-                // reference "trajectory" score. Comparable across hypotheses
-                // because every candidate shares the same normalized target.
-                PoseScoreMode::Trajectory => {
-                    let shape_cost = 0.5
-                        * self.lambda_regularization
-                        * result
-                            .coefficients
-                            .iter()
-                            .zip(&eigenvalues[..rank])
-                            .map(|(b, e)| b * b / e.max(f64::EPSILON))
-                            .sum::<f64>();
-                    result.negative_log_likelihood + shape_cost
-                }
+                    &result.rotation,
+                    result.scale,
+                    &result.translation,
+                    result.sigma2,
+                );
+                Ok(Candidate {
+                    index: id,
+                    rotation_index,
+                    anchor_index,
+                    score: data_cost - prior.ln() + kp_penalty,
+                    coefficients: result.coefficients,
+                    rotation: result.rotation,
+                    scale: result.scale,
+                    translation: result.translation,
+                    sigma2: result.sigma2,
+                    outlier_density: result.outlier_density,
+                    mixing_weights: result.mixing_weights,
+                    prior_cost: -prior.ln(),
+                    support: 1,
+                    contains_identity: initial.map_or(id == 0, |c| c.contains_identity),
+                })
             };
-            let kp_penalty = self.keypoint_penalty(
-                source,
-                modes,
-                &result.coefficients,
-                &result.rotation,
-                result.scale,
-                &result.translation,
-                result.sigma2,
-            );
-            Ok(Candidate {
-                index: id,
-                rotation_index,
-                anchor_index,
-                score: data_cost - prior.ln() + kp_penalty,
-                coefficients: result.coefficients,
-                rotation: result.rotation,
-                scale: result.scale,
-                translation: result.translation,
-                prior_cost: -prior.ln(),
-                support: 1,
-            })
-        };
         // Map `evaluate` over a set of hypothesis ids at a given budget.
         let map_eval = |ids: &[usize], iters: usize| -> Result<Vec<Candidate>> {
             if self.parallel {
-                ids.par_iter().map(|&id| evaluate(id, iters)).collect()
+                ids.par_iter()
+                    .map(|&id| evaluate(id, iters, None))
+                    .collect()
             } else {
-                ids.iter().map(|&id| evaluate(id, iters)).collect()
+                ids.iter().map(|&id| evaluate(id, iters, None)).collect()
             }
         };
 
@@ -432,26 +496,46 @@ impl PoseMarginalizedConfig {
         // fraction of the (larger) hypothesis set.
         let survivor_count = self.coarse_survivor_count.saturating_mul(anchor_count);
         let use_funnel = screen_iters < self.coarse_iterations && survivor_count < hypotheses.len();
-        let mut coarse: Vec<Candidate> = if use_funnel {
+        let coarse_merge_radius = self.merge_tolerance * rms_radius(&coarse_target);
+        let coarse: Vec<Candidate> = if use_funnel {
             // Screen every hypothesis cheaply, keep the best survivors (the
             // identity/centroid hypothesis always retained), then complete
             // only those to the full budget.
             let screened = map_eval(&all_ids, screen_iters)?;
-            let survivors = select_survivor_indices(&screened, survivor_count);
-            map_eval(&survivors, self.coarse_iterations)?
+            let survivors = select_distinct_candidates(
+                screened,
+                survivor_count,
+                &coarse_source,
+                &coarse_modes,
+                coarse_merge_radius,
+            );
+            let complete = |initial: &Candidate| {
+                evaluate(
+                    initial.index,
+                    self.coarse_iterations - screen_iters,
+                    Some(initial),
+                )
+            };
+            if self.parallel {
+                survivors
+                    .par_iter()
+                    .map(complete)
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                survivors.iter().map(complete).collect::<Result<Vec<_>>>()?
+            }
         } else {
             map_eval(&all_ids, self.coarse_iterations)?
         };
-        // Take the best `refine_count`, always keeping the identity hypothesis.
-        let identity = coarse.iter().find(|c| c.index == 0).cloned();
-        coarse.sort_by(|a, b| a.score.total_cmp(&b.score));
-        coarse.truncate(self.refine_count.min(coarse.len()));
-        if let Some(identity) = identity {
-            if coarse.len() > 1 && !coarse.iter().any(|c| c.index == 0) {
-                let last = coarse.len() - 1;
-                coarse[last] = identity;
-            }
-        }
+        // Spend the refinement budget on distinct fitted models. Identity's
+        // basin remains eligible even if a different seed represents it.
+        let coarse = select_distinct_candidates(
+            coarse,
+            self.refine_count,
+            &coarse_source,
+            &coarse_modes,
+            coarse_merge_radius,
+        );
         let target_indices = subset_indices(target, Some(self.refine_target_count));
         let mut source_indices = subset_indices(source, self.refine_source_count);
         // Anchored refinement needs every landmark vertex present in the
@@ -480,12 +564,30 @@ impl PoseMarginalizedConfig {
         let refined_target = select_rows(target, &target_indices);
         let refined_source = select_rows(source, &source_indices);
         let refined_modes = select_modes(modes, source.ncols(), &source_indices, eigenvalues.len());
+        // Geometry-only transfers are shared by all hypotheses, including
+        // equal-length subsamples whose vertex order differs.
+        let coarse_to_refine = self
+            .adaptive_mixing
+            .map(|_| MixingWeightMap::new(&coarse_source, &refined_source))
+            .transpose()?;
+        let refine_to_full = self
+            .adaptive_mixing
+            .map(|_| MixingWeightMap::new(&refined_source, source))
+            .transpose()?;
         let refine = |initial: &Candidate| -> Result<Candidate> {
-            let mut coefficients = vec![0.0; eigenvalues.len()];
-            coefficients[..initial.coefficients.len()].copy_from_slice(&initial.coefficients);
+            let mut state = initial.state(&coarse_source);
+            state.mixing_weights = initial.mixing_weights.as_deref().map(|pi| {
+                coarse_to_refine
+                    .as_ref()
+                    .expect("adaptive mixture map")
+                    .apply(pi)
+            });
+            state.mixing_reference = state
+                .mixing_weights
+                .as_ref()
+                .map(|_| refined_source.clone());
             let config = AtlasConfig {
                 em: EmConfig {
-                    sigma2: initial_sigma2,
                     max_iterations: self.refine_iterations,
                     tolerance: 0.0,
                     outlier_weight: self.outlier_weight,
@@ -499,15 +601,13 @@ impl PoseMarginalizedConfig {
                 optimize_similarity: true,
                 with_scale: self.with_scale,
                 kdtree_radius_scale: None,
-                initial_coefficients: Some(coefficients),
-                initial_rotation: Some(initial.rotation.clone()),
-                initial_scale: initial.scale,
-                initial_translation: Some(initial.translation.clone()),
+                initial_state: Some(state),
                 landmarks: refine_landmarks.clone(),
                 landmark_weight: self.refine_landmark_weight,
                 landmark_sigma: self.refine_landmark_sigma,
                 scale_bounds,
                 adaptive_mixing: self.adaptive_mixing,
+                ..Default::default()
             };
             let result =
                 AtlasRegistration::new(&refined_target, &refined_source, &refined_modes, config)?
@@ -523,15 +623,19 @@ impl PoseMarginalizedConfig {
             // The refined mixing proportions live on the refinement
             // subsample; lift them to the full source by nearest subsample
             // row so the full-cloud score sees the same switched-off points.
-            let mixing_full = result.mixing_weights.as_deref().map(|pi| {
-                let lifted = lift_to_full(pi, source, &refined_source);
-                mixing_factors(Some(&lifted)).expect("lifted proportions are present")
+            let pi_full = result.mixing_weights.as_deref().map(|pi| {
+                refine_to_full
+                    .as_ref()
+                    .expect("adaptive mixture map")
+                    .apply(pi)
             });
+            let mixing_full = mixing_factors(pi_full.as_deref());
             let score = score_candidate(
                 target,
                 &full_deformed,
                 result.sigma2,
                 self.outlier_weight,
+                result.outlier_density,
                 &result.coefficients,
                 eigenvalues,
                 self.lambda_regularization,
@@ -555,8 +659,12 @@ impl PoseMarginalizedConfig {
                 rotation: result.rotation,
                 scale: result.scale,
                 translation: result.translation,
+                sigma2: result.sigma2,
+                outlier_density: result.outlier_density,
+                mixing_weights: pi_full,
                 prior_cost: initial.prior_cost,
                 support: 1,
+                contains_identity: initial.contains_identity,
             })
         };
         let mut refined: Vec<Candidate> = if self.parallel {
@@ -594,6 +702,10 @@ impl PoseMarginalizedConfig {
             rotation: best.rotation,
             scale: best.scale,
             translation: best.translation,
+            sigma2: best.sigma2,
+            outlier_density: best.outlier_density,
+            mixing_reference: best.mixing_weights.as_ref().map(|_| source.clone()),
+            mixing_weights: best.mixing_weights,
             score: best.score,
             score_margin,
             posterior_entropy: entropy,
@@ -844,20 +956,25 @@ fn axis_angle([x, y, z]: [f64; 3], a: f64) -> DMatrix<f64> {
     let h = a / 2.;
     quaternion_matrix([x * h.sin(), y * h.sin(), z * h.sin(), h.cos()])
 }
-/// Flat hypothesis ids of the best `count` screened hypotheses, always
-/// including the identity/centroid hypothesis (id 0). Mirrors the reference
-/// finalist selection.
-fn select_survivor_indices(screened: &[Candidate], count: usize) -> Vec<usize> {
-    let keep = count.clamp(1, screened.len());
-    let mut order: Vec<usize> = (0..screened.len()).collect();
-    order.sort_by(|&a, &b| screened[a].score.total_cmp(&screened[b].score));
-    let mut survivors: Vec<usize> = order[..keep].iter().map(|&p| screened[p].index).collect();
-    if !survivors.contains(&0) {
-        if let Some(last) = survivors.last_mut() {
-            *last = 0;
+/// Merge before pruning so duplicate starts cannot crowd out a distinct fit.
+/// Keep the identity basin when the budget has room for more than one fit.
+fn select_distinct_candidates(
+    mut candidates: Vec<Candidate>,
+    count: usize,
+    source: &DMatrix<f64>,
+    modes: &DMatrix<f64>,
+    radius: f64,
+) -> Vec<Candidate> {
+    candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
+    let mut distinct = merge_converged(candidates, source, modes, radius);
+    let keep = count.min(distinct.len());
+    if keep > 1 && !distinct[..keep].iter().any(|c| c.contains_identity) {
+        if let Some(position) = distinct.iter().position(|c| c.contains_identity) {
+            distinct.swap(keep - 1, position);
         }
     }
-    survivors
+    distinct.truncate(keep);
+    distinct
 }
 /// Centroids, RMS radii and the reference scale shared by every translation
 /// seed of one search.
@@ -1004,41 +1121,6 @@ fn local_centroid(source: &DMatrix<f64>, center: usize, target_rms: f64) -> Vec<
     centroid
 }
 
-/// Relative mixing factors `M·π_m` (floored) from proportions, or `None`.
-fn mixing_factors(pi: Option<&[f64]>) -> Option<Vec<f64>> {
-    pi.map(|values| {
-        let m = values.len() as f64;
-        values.iter().map(|&p| (p * m).max(1e-9)).collect()
-    })
-}
-
-/// Lift per-row proportions on a subsample to the full cloud by nearest
-/// subsample row, renormalized to sum to one.
-fn lift_to_full(pi: &[f64], full: &DMatrix<f64>, subsample: &DMatrix<f64>) -> Vec<f64> {
-    if subsample.nrows() == full.nrows() {
-        return pi.to_vec();
-    }
-    let mut lifted: Vec<f64> = (0..full.nrows())
-        .map(|i| {
-            let point: Vec<f64> = (0..full.ncols()).map(|j| full[(i, j)]).collect();
-            let nearest = (0..subsample.nrows())
-                .min_by(|&a, &b| {
-                    squared_from(subsample, a, &point)
-                        .total_cmp(&squared_from(subsample, b, &point))
-                })
-                .unwrap_or(0);
-            pi[nearest]
-        })
-        .collect();
-    let total: f64 = lifted.iter().sum();
-    if total > 0.0 {
-        for value in &mut lifted {
-            *value /= total;
-        }
-    }
-    lifted
-}
-
 /// Merge refined candidates (sorted by score) whose fitted models agree to
 /// within `radius` (RMS over the source rows). The best-scoring member
 /// represents each cluster and carries the cluster's `support`.
@@ -1048,6 +1130,9 @@ fn merge_converged(
     modes: &DMatrix<f64>,
     radius: f64,
 ) -> Vec<Candidate> {
+    if radius <= 0.0 {
+        return refined;
+    }
     let mut clusters: Vec<Candidate> = Vec::with_capacity(refined.len());
     let mut fits: Vec<DMatrix<f64>> = Vec::with_capacity(refined.len());
     for candidate in refined {
@@ -1059,16 +1144,24 @@ fn merge_converged(
             candidate.scale,
             &candidate.translation,
         );
+        let threshold = radius * radius * fit.nrows().max(1) as f64;
         let existing = fits.iter().position(|other| {
-            let sum: f64 = fit
-                .iter()
-                .zip(other.iter())
-                .map(|(a, b)| (a - b).powi(2))
-                .sum();
-            (sum / fit.nrows().max(1) as f64).sqrt() <= radius
+            // Most coarse fits are far apart: stop as soon as the nonnegative
+            // partial sum rules out a merge, rather than scanning every vertex.
+            let mut sum = 0.0;
+            for (a, b) in fit.iter().zip(other.iter()) {
+                sum += (a - b).powi(2);
+                if sum > threshold {
+                    return false;
+                }
+            }
+            sum <= threshold
         });
         match existing {
-            Some(k) => clusters[k].support += 1,
+            Some(k) => {
+                clusters[k].support += candidate.support;
+                clusters[k].contains_identity |= candidate.contains_identity;
+            }
             None => {
                 clusters.push(candidate);
                 fits.push(fit);
@@ -1154,6 +1247,7 @@ fn score_candidate(
     ty: &DMatrix<f64>,
     sigma2: f64,
     w: f64,
+    outlier_density: f64,
     b: &[f64],
     eigenvalues: &[f64],
     lambda: f64,
@@ -1171,7 +1265,7 @@ fn score_candidate(
             .collect()
     });
     let out = if w > 0. {
-        w.ln() - (n as f64).ln()
+        w.ln() + outlier_density.ln()
     } else {
         f64::NEG_INFINITY
     };
@@ -1722,7 +1816,7 @@ mod landmark_pose_tests {
 mod fragment_seeding_tests {
     use super::{
         Candidate, PoseMarginalizedConfig, SeedFrame, axis_angle, merge_converged,
-        translation_anchors,
+        select_distinct_candidates, translation_anchors,
     };
     use nalgebra::DMatrix;
 
@@ -1888,8 +1982,12 @@ mod fragment_seeding_tests {
             rotation: axis_angle([0.0, 0.0, 1.0], angle),
             scale: 1.0,
             translation: t.to_vec(),
+            sigma2: 0.1,
+            outlier_density: 0.1,
+            mixing_weights: None,
             prior_cost: 0.0,
             support: 1,
+            contains_identity: false,
         };
         let refined = vec![
             make(10.0, 0.0, [0.0, 0.0, 0.0]),
@@ -1904,5 +2002,36 @@ mod fragment_seeding_tests {
             (clusters[0].score - 10.0).abs() < 1e-12,
             "best member represents"
         );
+    }
+
+    #[test]
+    fn distinct_selection_keeps_a_competing_basin_before_refinement() {
+        let model = tapered_rod(30);
+        let modes = DMatrix::zeros(model.len(), 1);
+        let make = |index, score, x| Candidate {
+            index,
+            rotation_index: index,
+            anchor_index: 0,
+            score,
+            coefficients: vec![0.0],
+            rotation: DMatrix::identity(3, 3),
+            scale: 1.0,
+            translation: vec![x, 0.0, 0.0],
+            sigma2: 0.1,
+            outlier_density: 0.1,
+            mixing_weights: None,
+            prior_cost: 0.0,
+            support: 1,
+            contains_identity: index == 0,
+        };
+        // Naive top-2 takes starts 1 and 0 in the same basin and loses start 2.
+        let candidates = vec![make(1, 1.0, 0.0), make(0, 1.1, 0.001), make(2, 2.0, 0.5)];
+        let distinct = select_distinct_candidates(candidates.clone(), 2, &model, &modes, 0.01);
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(distinct[0].index, 1);
+        assert!(distinct[0].contains_identity);
+        assert_eq!(distinct[1].index, 2);
+        let unmerged = select_distinct_candidates(candidates, 2, &model, &modes, 0.0);
+        assert_eq!(unmerged[1].index, 0);
     }
 }

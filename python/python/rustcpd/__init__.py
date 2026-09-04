@@ -28,6 +28,7 @@ bitwise-identical to serial execution).
 from ._core import (
     AffineResult,
     AtlasResult,
+    AtlasState,
     Correspondences,
     DeformableResult,
     PoseInitialization,
@@ -154,6 +155,7 @@ def pose_marginalized_initialization(
 __all__ = [
     "AffineResult",
     "AtlasResult",
+    "AtlasState",
     "Correspondences",
     "DeformableResult",
     "PoseInitialization",

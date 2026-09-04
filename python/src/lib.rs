@@ -236,6 +236,57 @@ impl DeformableResult {
     }
 }
 
+/// Resumable pose, shape, variance and mixture in original coordinate units.
+/// Obtain from `AtlasResult.state` or `PoseInitialization.state` and pass as
+/// `register_atlas(initial_state=...)`. Keep the model/EM options consistent
+/// between calls to continue the same fit.
+#[pyclass(frozen, module = "rustcpd")]
+pub struct AtlasState {
+    inner: cpd::AtlasState,
+}
+
+#[pymethods]
+impl AtlasState {
+    #[getter]
+    fn coefficients(&self, py: Python<'_>) -> Py<PyArray1<f64>> {
+        vector_to(py, &self.inner.coefficients)
+    }
+    #[getter]
+    fn rotation(&self, py: Python<'_>) -> Py<PyArray2<f64>> {
+        matrix_to(py, &self.inner.rotation)
+    }
+    #[getter]
+    fn scale(&self) -> f64 {
+        self.inner.scale
+    }
+    #[getter]
+    fn translation(&self, py: Python<'_>) -> Py<PyArray1<f64>> {
+        vector_to(py, &self.inner.translation)
+    }
+    #[getter]
+    fn sigma2(&self) -> f64 {
+        self.inner.sigma2
+    }
+    #[getter]
+    fn outlier_density(&self) -> f64 {
+        self.inner.outlier_density
+    }
+    #[getter]
+    fn mixing_weights(&self, py: Python<'_>) -> Option<Py<PyArray1<f64>>> {
+        self.inner
+            .mixing_weights
+            .as_deref()
+            .map(|pi| vector_to(py, pi))
+    }
+    #[getter]
+    fn mixing_reference(&self, py: Python<'_>) -> Option<Py<PyArray2<f64>>> {
+        self.inner
+            .mixing_reference
+            .as_ref()
+            .map(|mean| matrix_to(py, mean))
+    }
+}
+
 /// Result of a statistical-shape-model (atlas) registration.
 #[pyclass(frozen, module = "rustcpd")]
 pub struct AtlasResult {
@@ -277,14 +328,23 @@ pub struct AtlasResult {
     /// target, the unobserved part of the model).
     #[pyo3(get)]
     pub mixing_weights: Option<Py<PyArray1<f64>>>,
-    // Retained in native form for reconstruct / apply_similarity.
-    coefficients_vec: Vec<f64>,
-    rotation_matrix: DMatrix<f64>,
-    translation_vec: Vec<f64>,
+    /// Outlier weight used during registration and inherited by completion.
+    #[pyo3(get)]
+    pub outlier_weight: f64,
+    // Preserve the full observation model for continuation and completion.
+    inner: cpd::AtlasResult,
 }
 
 #[pymethods]
 impl AtlasResult {
+    /// Pose, shape, variance and mixture for `register_atlas(initial_state=...)`.
+    #[getter]
+    fn state(&self) -> AtlasState {
+        AtlasState {
+            inner: self.inner.state(),
+        }
+    }
+
     /// Reconstruct the fitted shape at full resolution:
     /// `similarity(mean + modes @ b)` in the target frame.
     ///
@@ -327,7 +387,7 @@ impl AtlasResult {
     /// what was registered). Visibility is inferred from the fitted
     /// correspondence, optionally anchored by `completeness ∈ (0, 1]`.
     #[pyo3(signature = (target, mean, modes, eigenvalues, *, completeness = None,
-        visibility_floor = 1e-6, prior_temperature = 1.0, outlier_weight = 0.0,
+        visibility_floor = 1e-6, prior_temperature = 1.0, outlier_weight = None,
         estimate_discrepancy = true))]
     #[allow(clippy::too_many_arguments)]
     fn posterior(
@@ -340,7 +400,7 @@ impl AtlasResult {
         completeness: Option<f64>,
         visibility_floor: f64,
         prior_temperature: f64,
-        outlier_weight: f64,
+        outlier_weight: Option<f64>,
         estimate_discrepancy: bool,
     ) -> PyResult<ShapePosterior> {
         let target = matrix_from(target.as_array());
@@ -452,22 +512,8 @@ impl ShapePosterior {
 }
 
 impl AtlasResult {
-    /// Rebuild a minimal core result carrying only the fields the
-    /// transform helpers read.
-    fn core(&self) -> cpd::AtlasResult {
-        cpd::AtlasResult {
-            points: DMatrix::zeros(0, 0),
-            coefficients: self.coefficients_vec.clone(),
-            rotation: self.rotation_matrix.clone(),
-            scale: self.scale,
-            translation: self.translation_vec.clone(),
-            sigma2: self.sigma2,
-            iterations: self.iterations,
-            difference: self.difference,
-            negative_log_likelihood: f64::INFINITY,
-            landmark_rms: f64::NAN,
-            mixing_weights: None,
-        }
+    fn core(&self) -> &cpd::AtlasResult {
+        &self.inner
     }
 }
 
@@ -486,6 +532,13 @@ pub struct PoseInitialization {
     /// Translation of the winning hypothesis, shape `(3,)`.
     #[pyo3(get)]
     pub translation: Py<PyArray1<f64>>,
+    /// Fitted variance in squared original target-coordinate units.
+    #[pyo3(get)]
+    pub sigma2: f64,
+    /// Fitted mixture probabilities on the full source, or None.
+    #[pyo3(get)]
+    pub mixing_weights: Option<Py<PyArray1<f64>>>,
+    state_inner: cpd::AtlasState,
     /// Negative-log-posterior score of the winner (lower is better).
     /// Unnormalized: it only ranks hypotheses *within a single run* (and
     /// includes the keypoint penalty when landmarks are set). Not comparable
@@ -514,12 +567,23 @@ pub struct PoseInitialization {
     #[pyo3(get)]
     pub distinct_hypotheses: usize,
     /// Refined starts that converged to the winning solution. Several starts
-    /// agreeing is evidence *for* the winner, not ambiguity.
+    /// agreeing measures search agreement, not calibrated pose confidence.
     #[pyo3(get)]
     pub winner_support: usize,
     /// Translation anchors actually used per rotation (1 = centroid only).
     #[pyo3(get)]
     pub translation_anchors_used: usize,
+}
+
+#[pymethods]
+impl PoseInitialization {
+    /// Complete fitted state for a following atlas registration.
+    #[getter]
+    fn state(&self) -> AtlasState {
+        AtlasState {
+            inner: self.state_inner.clone(),
+        }
+    }
 }
 
 /// Rigid (rotation + translation + optional scale) registration of the
@@ -831,6 +895,10 @@ fn register_deformable(
 /// `adaptive_mixing=alpha`, which re-estimates per-model-point mixing
 /// proportions so points with no supporting data switch off (reported as
 /// `result.mixing_weights`).
+///
+/// Pass `initial_state=init.state` or `fit.state` to preserve pose, shape,
+/// variance and mixture across stages. Keep the same model/EM settings; the
+/// state handles coordinate-frame and sampling changes automatically.
 #[pyfunction]
 #[pyo3(signature = (target, mean, modes, eigenvalues, *,
     lambda_regularization = 0.1, normalize = false,
@@ -838,6 +906,7 @@ fn register_deformable(
     kdtree_radius_scale = None,
     initial_coefficients = None, initial_rotation = None,
     initial_scale = 1.0, initial_translation = None, sigma2 = None,
+    initial_state = None,
     landmark_indices = None, landmark_targets = None, landmark_weight = 0.0,
     landmark_sigma = None, scale_bounds = None, adaptive_mixing = None,
     max_iterations = 100, tolerance = 1e-3, outlier_weight = 0.0,
@@ -859,6 +928,7 @@ fn register_atlas(
     initial_scale: f64,
     initial_translation: Option<Vec<f64>>,
     sigma2: Option<f64>,
+    initial_state: Option<PyRef<'_, AtlasState>>,
     landmark_indices: Option<Vec<usize>>,
     landmark_targets: Option<PyArrayLike2<'_, f64, AllowTypeChange>>,
     landmark_weight: f64,
@@ -916,6 +986,7 @@ fn register_atlas(
         initial_rotation: initial_rotation.as_ref().map(|r| matrix_from(r.as_array())),
         initial_scale,
         initial_translation,
+        initial_state: initial_state.map(|state| state.inner.clone()),
         landmarks,
         landmark_weight,
         landmark_sigma,
@@ -936,9 +1007,8 @@ fn register_atlas(
         difference: result.difference,
         landmark_rms: result.landmark_rms,
         mixing_weights: result.mixing_weights.as_deref().map(|pi| vector_to(py, pi)),
-        coefficients_vec: result.coefficients,
-        rotation_matrix: result.rotation,
-        translation_vec: result.translation,
+        outlier_weight: result.outlier_weight,
+        inner: result,
     })
 }
 
@@ -1094,6 +1164,9 @@ fn pose_initialize(
         rotation: matrix_to(py, &result.rotation),
         scale: result.scale,
         translation: vector_to(py, &result.translation),
+        sigma2: result.sigma2,
+        mixing_weights: result.mixing_weights.as_deref().map(|pi| vector_to(py, pi)),
+        state_inner: result.state(),
         score: result.score,
         score_margin: result.score_margin,
         posterior_entropy: result.posterior_entropy,
@@ -1256,6 +1329,7 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AffineResult>()?;
     module.add_class::<DeformableResult>()?;
     module.add_class::<AtlasResult>()?;
+    module.add_class::<AtlasState>()?;
     module.add_class::<PoseInitialization>()?;
     module.add_class::<Correspondences>()?;
     module.add_class::<ShapePosterior>()?;

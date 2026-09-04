@@ -8,7 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve fitted pose, shape coefficients, variance and adaptive mixture from
+  screening through coarse completion and refinement. Screened survivors now
+  run only the remaining coarse iterations instead of restarting. The initial
+  variance override applies only to the first coarse pass.
+- Merge duplicate fitted models **before** screening/refinement pruning, so
+  multiple starts in one basin cannot consume the candidate budget. Preserve
+  the identity basin even when another start represents it. Zero merge
+  tolerance now disables clustering, including for exactly equal fits.
+- Completion now conditions on the fitted variance and adaptive mixture.
+  Python retains the native observation model instead of discarding its
+  weights. `posterior(outlier_weight=None)` inherits the fitted outlier weight;
+  an explicit value overrides it. Rust `PosteriorOptions::outlier_weight` is
+  now `Option<f64>` with the same semantics.
+- Correct completion's non-default `prior_temperature` to multiply prior
+  precision, as documented for matching atlas `lambda_regularization`, rather
+  than taking its reciprocal. The default `1.0` is unchanged.
+- Preserve the physical uniform-background density across stages and
+  completion, including when normalization or target point count changes.
+  Pose scoring uses that same density. Mixture transfers handle equal-length
+  vertex permutations as well as changes in resolution, with shared k-d-tree
+  maps across pose hypotheses.
+
 ### Added
+
+- `AtlasState`, available through `AtlasResult::state()` and
+  `PoseMarginalizedInitialization::state()` (Python `fit.state` / `init.state`),
+  and `AtlasConfig::initial_state` (Python `register_atlas(initial_state=...)`).
+  Variance is stored in original target units and converted automatically;
+  state includes mixture probabilities and their reference mean coordinates.
+  Receiving model/EM options remain explicit. Extra shape modes start at zero.
+- Pose results expose the fitted `sigma2` and full-source `mixing_weights`.
+- Regression tests for split-run continuation across normalized/raw frames,
+  preservation of displaced fragments during final registration, candidate
+  diversity, weight transfer, and completion versus independent dense Gaussian
+  conditioning in Python.
 
 - **Translation seeding for partial targets** in the pose search.
   `PoseMarginalizedConfig::translation_anchor_count` (Python
