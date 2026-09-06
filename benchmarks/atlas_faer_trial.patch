@@ -1,0 +1,17 @@
+--- a/rustcpd/src/atlas.rs
++++ b/rustcpd/src/atlas.rs
+@@ -681,7 +681,13 @@
+                     *value = original * stats.p1[flat / d];
+                 }
+             }
+-            let mut system = modes.tr_mul(&scaled_modes);
++            let mut system = if rank >= 16 && modes.nrows() >= 256 {
++                let mut matrix = DMatrix::zeros(rank, rank);
++                crate::solve::matmul_into(&mut matrix, &modes, true, &scaled_modes, false, false);
++                matrix
++            } else {
++                modes.tr_mul(&scaled_modes)
++            };
+             let rhs = scaled_modes.tr_mul(&residual_matrix);
+             let gamma = self.config.lambda_regularization * sigma2 / scale.powi(2);
+             for a in 0..rank {

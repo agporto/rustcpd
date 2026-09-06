@@ -1,4 +1,5 @@
 use nalgebra::DMatrix;
+use rayon::prelude::*;
 
 use crate::atlas_state::{effective_outlier_weight, mixing_factors};
 use crate::em::{
@@ -671,8 +672,9 @@ impl<'a> AtlasRegistration<'a> {
                     residual_matrix[(i * d + j, 0)] = inverse - y[(i, j)];
                 }
             }
-            // system = Uᵀ·diag(w)·U and rhs = (diag(w)·U)ᵀ·residual through
-            // one row-scaled copy of the modes and two GEMMs.
+            // system = Uᵀ·diag(w)·U and rhs = (diag(w)·U)ᵀ·residual share
+            // one row-scaled copy of the modes. Cholesky uses only the lower
+            // triangle of the system; atlas_gram preserves its dot products.
             for (mut destination, source) in scaled_modes.column_iter_mut().zip(modes.column_iter())
             {
                 for (flat, (value, &original)) in
@@ -681,7 +683,7 @@ impl<'a> AtlasRegistration<'a> {
                     *value = original * stats.p1[flat / d];
                 }
             }
-            let mut system = modes.tr_mul(&scaled_modes);
+            let mut system = atlas_gram(&modes, &scaled_modes, self.config.em.parallel);
             let rhs = scaled_modes.tr_mul(&residual_matrix);
             let gamma = self.config.lambda_regularization * sigma2 / scale.powi(2);
             for a in 0..rank {
@@ -819,6 +821,93 @@ impl<'a> AtlasRegistration<'a> {
             outlier_weight: self.config.em.outlier_weight,
             outlier_density,
         })
+    }
+}
+
+/// Cholesky reads only the lower triangle. Compute those entries with the
+/// exact same column dot products as `tr_mul`, preserving its accumulation
+/// order even for poorly conditioned coefficient systems. Parallel columns
+/// have no shared reduction, so scheduling cannot change their values.
+fn atlas_gram(modes: &DMatrix<f64>, weighted_modes: &DMatrix<f64>, parallel: bool) -> DMatrix<f64> {
+    let rank = modes.ncols();
+    if rank < 16 || modes.nrows() < 256 {
+        return modes.tr_mul(weighted_modes);
+    }
+    let mut system = DMatrix::zeros(rank, rank);
+    let column = |(b, values): (usize, &mut [f64])| {
+        let weighted = weighted_modes.column(b);
+        for (a, value) in values.iter_mut().enumerate().skip(b) {
+            *value = modes.column(a).dot(&weighted);
+        }
+    };
+    if parallel && modes.nrows().saturating_mul(rank).saturating_mul(rank) >= 1_000_000 {
+        system
+            .as_mut_slice()
+            .par_chunks_mut(rank)
+            .enumerate()
+            .for_each(column);
+    } else {
+        system
+            .as_mut_slice()
+            .chunks_mut(rank)
+            .enumerate()
+            .for_each(column);
+    }
+    system
+}
+
+#[cfg(test)]
+mod gram_tests {
+    use super::atlas_gram;
+    use nalgebra::DMatrix;
+
+    #[test]
+    fn cholesky_inputs_and_solutions_match_original_bits() {
+        for (rows, rank) in [(30, 8), (255, 16), (256, 16), (1200, 32), (768, 64)] {
+            let modes = DMatrix::from_fn(rows, rank, |i, a| {
+                ((i * 17 + a * 31 + 1) as f64 * 0.037).sin() / (a + 1) as f64
+            });
+            let weighted = DMatrix::from_fn(rows, rank, |i, a| {
+                modes[(i, a)] * [0.0, 1e-9, 0.001, 1.0, 1e6][i / 3 % 5]
+            });
+            let original = modes.tr_mul(&weighted);
+            let rhs = DMatrix::from_fn(rank, 1, |a, _| (a as f64 + 1.0).sin());
+            for parallel in [false, true] {
+                let mut actual = atlas_gram(&modes, &weighted, parallel);
+                for b in 0..rank {
+                    for a in b..rank {
+                        assert_eq!(actual[(a, b)].to_bits(), original[(a, b)].to_bits());
+                    }
+                }
+                let mut reference = original.clone();
+                for a in 0..rank {
+                    actual[(a, a)] += 0.1;
+                    reference[(a, a)] += 0.1;
+                }
+                let expected = reference.cholesky().unwrap().solve(&rhs);
+                let solved = actual.cholesky().unwrap().solve(&rhs);
+                for (actual, expected) in solved.iter().zip(expected.iter()) {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gram_is_bitwise_independent_of_thread_count() {
+        let modes = DMatrix::from_fn(2048, 32, |i, a| ((i + a * 7) as f64 * 0.13).sin());
+        let weighted = DMatrix::from_fn(2048, 32, |i, a| modes[(i, a)] * (1 + i % 19) as f64);
+        let expected = atlas_gram(&modes, &weighted, false);
+        for threads in [1, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let actual = pool.install(|| atlas_gram(&modes, &weighted, true));
+            for (actual, expected) in actual.iter().zip(expected.iter()) {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+        }
     }
 }
 
