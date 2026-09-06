@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-09-05
+
+### Migration from 3.1
+
+- **Breaking Rust API:** `PosteriorOptions::outlier_weight` is now
+  `Option<f64>`. Wrap explicit values in `Some(...)`; `None` inherits the
+  fitted observation model. This source break motivates the shared Rust/Python
+  major version bump.
+- **Changed completion defaults:** omitting Python `posterior(outlier_weight=...)`
+  now inherits the fitted outlier weight. Pass `0.0` for clean assignments.
+  Completion also retains fitted variance and adaptive mixing, so this override
+  alone does not reproduce every 3.1 result.
+- **Corrected prior strength:** non-default `prior_temperature` now multiplies
+  prior precision. Revalidate completion means and uncertainty when upgrading.
+- For continuation examples, configuration requirements, and reproducibility
+  guidance, see [Migrating to 4.0](docs/MIGRATING_4.md).
+
 ### Fixed
 
 - Preserve fitted pose, shape coefficients, variance and adaptive mixture from
@@ -69,9 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Python `result.mixing_weights`) and used in the pose score. The E-step
   gains an internal `posterior_stats_weighted` applied identically on the
   dense, single-precision, truncated and k-NN paths.
-- `PoseMarginalizedConfig::initial_sigma2`: starting variance for the coarse
-  and refinement EM in the normalized frame. When translation seeding
-  activates and this is `None`, the search now anneals from
+- `PoseMarginalizedConfig::initial_sigma2`: starting variance for the first
+  coarse EM pass in the normalized frame; subsequent passes and refinement
+  retain fitted variance. When translation seeding activates and this is
+  `None`, the search now anneals from
   `FRAGMENT_INITIAL_SIGMA2 = 0.25` (the fragment's scale) instead of the
   classic whole-model estimate — in testing this, not the seeds, decided
   whether a displaced fragment was recovered.
@@ -467,6 +485,8 @@ faster. Numerical agreement with the original is ≤ 3e-12 relative across a
 parity suite covering every registration family. See
 [`rustcpd/BENCHMARKS.md`](rustcpd/BENCHMARKS.md).
 
+[Unreleased]: https://github.com/agporto/rustcpd/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/agporto/rustcpd/releases/tag/v4.0.0
 [3.1.0]: https://github.com/agporto/rustcpd/releases/tag/v3.1.0
 [3.0.0]: https://github.com/agporto/rustcpd/releases/tag/v3.0.0
 
