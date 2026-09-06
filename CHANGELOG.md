@@ -80,6 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Atlas coefficient updates compute only the Gram matrix's lower triangle
+  for larger models, and parallelize independent columns when enabled. Each
+  entry retains the original dot-product arithmetic. Reproducible timings
+  and bitwise comparisons against the previous implementation are recorded
+  in `benchmarks/ATLAS_GRAM_BENCHMARK.md`.
 - Pose `score_margin`, `posterior_entropy` and `effective_hypotheses` are now
   computed over *distinct* refined solutions: starts that converged to the
   same fit (RMS distance below `merge_tolerance` × target RMS radius,
