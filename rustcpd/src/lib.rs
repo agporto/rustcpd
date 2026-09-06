@@ -24,6 +24,7 @@
 
 mod affine;
 mod atlas;
+mod atlas_state;
 #[cfg(feature = "completion")]
 mod completion;
 mod deformable;
@@ -36,6 +37,7 @@ mod solve;
 
 pub use affine::{AffineConfig, AffineRegistration, AffineResult};
 pub use atlas::{AtlasConfig, AtlasRegistration, AtlasResult};
+pub use atlas_state::AtlasState;
 #[cfg(feature = "completion")]
 pub use completion::{PosteriorOptions, ShapePosterior, complete_shape, mixture_sample_shapes};
 pub use deformable::{
@@ -48,5 +50,7 @@ pub use em::{
 };
 pub use error::{Error, Result};
 pub use nalgebra::DMatrix;
-pub use pose::{PoseMarginalizedConfig, PoseMarginalizedInitialization, PoseScoreMode};
+pub use pose::{
+    FRAGMENT_INITIAL_SIGMA2, PoseMarginalizedConfig, PoseMarginalizedInitialization, PoseScoreMode,
+};
 pub use rigid::{RigidConfig, RigidRegistration, RigidResult};

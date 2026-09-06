@@ -28,6 +28,7 @@ bitwise-identical to serial execution).
 from ._core import (
     AffineResult,
     AtlasResult,
+    AtlasState,
     Correspondences,
     DeformableResult,
     PoseInitialization,
@@ -76,6 +77,12 @@ def pose_marginalized_initialization(
     refine_landmark_weight=0.0,
     refine_landmark_sigma=None,
     with_scale=True,
+    translation_anchor_count=1,
+    anchor_completeness_threshold=0.9,
+    scale_bounds=None,
+    adaptive_mixing=None,
+    merge_tolerance=0.02,
+    initial_sigma2=None,
     seed=0,
     n_jobs=1,
 ):
@@ -95,6 +102,12 @@ def pose_marginalized_initialization(
     localization std, preferred) or the heuristic ``landmark_weight``; the
     ``refine_landmark_*`` pair anchors the refinement EM. All default off, so
     existing callers are unaffected.
+
+    The partial-target options are forwarded as well: ``translation_anchor_count``
+    (translation seeds per rotation; needs ``with_scale=False`` or
+    ``scale_bounds``), ``anchor_completeness_threshold``, ``scale_bounds``,
+    ``adaptive_mixing``, ``merge_tolerance`` and ``initial_sigma2``; see
+    :func:`pose_initialize`.
     """
     import numpy as _np
 
@@ -128,6 +141,12 @@ def pose_marginalized_initialization(
         refine_landmark_weight=refine_landmark_weight,
         refine_landmark_sigma=refine_landmark_sigma,
         with_scale=with_scale,
+        translation_anchor_count=translation_anchor_count,
+        anchor_completeness_threshold=anchor_completeness_threshold,
+        scale_bounds=scale_bounds,
+        adaptive_mixing=adaptive_mixing,
+        merge_tolerance=merge_tolerance,
+        initial_sigma2=initial_sigma2,
         seed=seed,
         parallel=(n_jobs != 1),
     )
@@ -136,6 +155,7 @@ def pose_marginalized_initialization(
 __all__ = [
     "AffineResult",
     "AtlasResult",
+    "AtlasState",
     "Correspondences",
     "DeformableResult",
     "PoseInitialization",

@@ -42,6 +42,25 @@ class DeformableResult:
     difference: float
     def transform(self, z: _ArrayLike) -> NDArray[np.float64]: ...
 
+class AtlasState:
+    """Snapshot for register_atlas(initial_state=...). Values use original units."""
+    @property
+    def coefficients(self) -> NDArray[np.float64]: ...
+    @property
+    def rotation(self) -> NDArray[np.float64]: ...
+    @property
+    def scale(self) -> float: ...
+    @property
+    def translation(self) -> NDArray[np.float64]: ...
+    @property
+    def sigma2(self) -> float: ...
+    @property
+    def outlier_density(self) -> float: ...
+    @property
+    def mixing_weights(self) -> NDArray[np.float64] | None: ...
+    @property
+    def mixing_reference(self) -> NDArray[np.float64] | None: ...
+
 class AtlasResult:
     points: NDArray[np.float64]
     coefficients: NDArray[np.float64]
@@ -55,6 +74,12 @@ class AtlasResult:
     # landmarks. Noise floor is sqrt(D)*tau (sqrt(3)*tau in 3D); normalized
     # discrepancy (landmark_rms/(sqrt(D)*tau))**2 is ~1 at the noise floor.
     landmark_rms: float
+    # Per-source mixing proportions (sum to 1) when adaptive_mixing was set;
+    # None for classic uniform mixing.
+    mixing_weights: NDArray[np.float64] | None
+    outlier_weight: float
+    @property
+    def state(self) -> AtlasState: ...
     def reconstruct(
         self, mean: _ArrayLike, modes: _ArrayLike
     ) -> NDArray[np.float64]: ...
@@ -69,7 +94,7 @@ class AtlasResult:
         completeness: float | None = ...,
         visibility_floor: float = ...,
         prior_temperature: float = ...,
-        outlier_weight: float = ...,
+        outlier_weight: float | None = ...,
         estimate_discrepancy: bool = ...,
     ) -> ShapePosterior: ...
 
@@ -78,6 +103,10 @@ class PoseInitialization:
     rotation: NDArray[np.float64]
     scale: float
     translation: NDArray[np.float64]
+    sigma2: float
+    mixing_weights: NDArray[np.float64] | None
+    @property
+    def state(self) -> AtlasState: ...
     # Unnormalized negative-log-posterior of the winner: ranks hypotheses only
     # within a single run (includes the keypoint penalty when landmarks are set).
     # Not comparable across runs, keypoint counts, or landmark_sigma values. Use
@@ -89,6 +118,12 @@ class PoseInitialization:
     effective_hypotheses: float
     hypotheses_evaluated: int
     hypotheses_refined: int
+    # Distinct solutions after merging refined starts that converged to the
+    # same fit, how many starts backed the winner, and the translation anchors
+    # actually seeded per rotation (1 = centroid only).
+    distinct_hypotheses: int
+    winner_support: int
+    translation_anchors_used: int
 
 class Correspondences:
     matches: NDArray[np.int64]
@@ -196,11 +231,14 @@ def register_atlas(
     initial_rotation: _ArrayLike | None = ...,
     initial_scale: float = ...,
     initial_translation: Sequence[float] | None = ...,
+    initial_state: AtlasState | None = ...,
     sigma2: float | None = ...,
     landmark_indices: Sequence[int] | None = ...,
     landmark_targets: _ArrayLike | None = ...,
     landmark_weight: float = ...,
     landmark_sigma: float | None = ...,
+    scale_bounds: tuple[float, float] | None = ...,
+    adaptive_mixing: float | None = ...,
     max_iterations: int = ...,
     tolerance: float = ...,
     outlier_weight: float = ...,
@@ -236,6 +274,12 @@ def pose_initialize(
     refine_landmark_weight: float = ...,
     refine_landmark_sigma: float | None = ...,
     with_scale: bool = ...,
+    translation_anchor_count: int = ...,
+    anchor_completeness_threshold: float = ...,
+    scale_bounds: tuple[float, float] | None = ...,
+    adaptive_mixing: float | None = ...,
+    merge_tolerance: float = ...,
+    initial_sigma2: float | None = ...,
     seed: int = ...,
     parallel: bool = ...,
     single_precision: bool = ...,

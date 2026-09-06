@@ -1,9 +1,11 @@
 use nalgebra::DMatrix;
 
+use crate::atlas_state::{effective_outlier_weight, mixing_factors};
 use crate::em::{
-    EmConfig, SparseIndex, initialize_sigma2, posterior_stats, validate_clouds, variance_floor,
+    EmConfig, SparseIndex, initialize_sigma2, posterior_stats_weighted, validate_clouds,
+    variance_floor,
 };
-use crate::{Error, Result};
+use crate::{AtlasState, Error, Result};
 
 /// Configuration for statistical-shape-model (atlas) registration.
 #[derive(Clone, Debug)]
@@ -39,6 +41,14 @@ pub struct AtlasConfig {
     pub initial_scale: f64,
     /// Starting translation (defaults to zero).
     pub initial_translation: Option<Vec<f64>>,
+    /// Resume an atlas/pose fit, including its variance and mixture, using
+    /// [`AtlasResult::state`] or [`crate::PoseMarginalizedInitialization::state`].
+    /// Cannot be combined with the individual initial-pose fields. Variance is
+    /// automatically converted from target units into the working frame;
+    /// an explicit `em.sigma2` overrides it (in working-frame units).
+    /// Other fitting settings still come from this config. With
+    /// `adaptive_mixing = None`, supplied mixture weights are held fixed.
+    pub initial_state: Option<AtlasState>,
     /// Anchored keypoint correspondences: each entry pairs a source-model
     /// vertex index with its known target coordinate (in the original target
     /// frame). Unlike [`Self::initial_rotation`] these persist through every
@@ -77,6 +87,27 @@ pub struct AtlasConfig {
     /// truncated SSM cannot reproduce. Takes precedence over `landmark_weight`
     /// when set. `None` (default) keeps the heuristic weight behavior.
     pub landmark_sigma: Option<f64>,
+    /// Optional `(min, max)` bounds on the isotropic scale. The starting
+    /// scale is clamped into the interval and every M-step estimate is
+    /// clamped after the rotation is solved (the translation then uses the
+    /// clamped value). Only meaningful with [`Self::with_scale`]; ignored
+    /// otherwise. Intended for **partial targets**: when the target is a
+    /// fragment of the model, the closed-form scale estimate is biased toward
+    /// shrinking the whole model into the fragment, and a physically
+    /// motivated interval (e.g. `(0.8, 1.25)` for a species-level atlas)
+    /// removes that degenerate optimum. `None` (default) leaves scale free.
+    pub scale_bounds: Option<(f64, f64)>,
+    /// Adaptive per-source mixing proportions. Classic CPD gives every
+    /// model point the same mixing weight `1/M`; with a partial target that
+    /// forces model points with no data to keep competing for mass and
+    /// biases the pose toward centering the whole model on the fragment.
+    /// `Some(alpha)` instead re-estimates `π_m ∝ p1_m + alpha` after every
+    /// E-step (a Dirichlet(`alpha`) prior keeps unused points at a small
+    /// floor instead of exactly zero), so model points the data cannot
+    /// explain switch themselves off. `alpha` is in units of posterior mass;
+    /// `1.0` is a sensible default, larger values keep the weights closer to
+    /// uniform. `None` (default) is classic CPD.
+    pub adaptive_mixing: Option<f64>,
 }
 
 impl Default for AtlasConfig {
@@ -93,9 +124,12 @@ impl Default for AtlasConfig {
             initial_rotation: None,
             initial_scale: 1.0,
             initial_translation: None,
+            initial_state: None,
             landmarks: Vec::new(),
             landmark_weight: 0.0,
             landmark_sigma: None,
+            scale_bounds: None,
+            adaptive_mixing: None,
         }
     }
 }
@@ -136,9 +170,40 @@ pub struct AtlasResult {
     /// `χ² = Σₗ‖rₗ‖² / (D·K·τ²)`), which is ≈ 1 when the residuals are just
     /// localization noise and ≫ 1 when the anchors are fighting the fit.
     pub landmark_rms: f64,
+    /// Final per-source mixing proportions `π_m` (length `M`, summing to 1)
+    /// when [`AtlasConfig::adaptive_mixing`] is set; `None` for classic
+    /// uniform mixing. Small values mark model points the target data did
+    /// not support — for a partial target, the unobserved part of the model.
+    pub mixing_weights: Option<Vec<f64>>,
+    /// Original mean-shape vertices associated with `mixing_weights`.
+    /// Retained only for a nonuniform/adaptive mixture, to transfer occupancies
+    /// when resuming or completing at another resolution.
+    pub mixing_reference: Option<DMatrix<f64>>,
+    /// Outlier mixture weight used by this fit; inherited by completion unless
+    /// explicitly overridden in `PosteriorOptions`.
+    pub outlier_weight: f64,
+    /// Uniform background density in original target coordinates, retained
+    /// across continuation and completion even when sampling/frame changes.
+    pub outlier_density: f64,
 }
 
 impl AtlasResult {
+    /// Capture the pose, shape, variance and mixture for a subsequent fit.
+    /// Keep the receiving config's model/EM settings consistent to continue
+    /// the same optimization. All state values use original coordinate units.
+    pub fn state(&self) -> AtlasState {
+        AtlasState {
+            coefficients: self.coefficients.clone(),
+            rotation: self.rotation.clone(),
+            scale: self.scale,
+            translation: self.translation.clone(),
+            sigma2: self.sigma2,
+            outlier_density: self.outlier_density,
+            mixing_weights: self.mixing_weights.clone(),
+            mixing_reference: self.mixing_reference.clone(),
+        }
+    }
+
     /// Reconstruct the fitted shape at full resolution.
     ///
     /// Applies the estimated coefficients to a (typically denser)
@@ -245,6 +310,18 @@ impl<'a> AtlasRegistration<'a> {
             return Err(Error::PositiveParameter("kdtree_radius_scale"));
         }
         let d = x.ncols();
+        if let Some(state) = &config.initial_state {
+            state.validate(d, modes.ncols())?;
+            if config.initial_coefficients.is_some()
+                || config.initial_rotation.is_some()
+                || config.initial_translation.is_some()
+                || config.initial_scale != 1.0
+            {
+                return Err(Error::InvalidShape(
+                    "initial_state conflicts with individual initializers",
+                ));
+            }
+        }
         if config
             .initial_rotation
             .as_ref()
@@ -277,6 +354,17 @@ impl<'a> AtlasRegistration<'a> {
             .is_some_and(|t2| !t2.is_finite() || t2 <= 0.0)
         {
             return Err(Error::PositiveParameter("landmark_sigma"));
+        }
+        if let Some((low, high)) = config.scale_bounds {
+            if !low.is_finite() || !high.is_finite() || low <= 0.0 || high < low {
+                return Err(Error::PositiveParameter("scale_bounds"));
+            }
+        }
+        if config
+            .adaptive_mixing
+            .is_some_and(|alpha| !alpha.is_finite() || alpha < 0.0)
+        {
+            return Err(Error::PositiveParameter("adaptive_mixing"));
         }
         for (index, point) in &config.landmarks {
             if *index >= mean.nrows() {
@@ -330,19 +418,29 @@ impl<'a> AtlasRegistration<'a> {
                 1.0,
             )
         };
+        let state = self.config.initial_state.as_ref();
         let mut coefficients = self
             .config
             .initial_coefficients
             .clone()
             .unwrap_or_else(|| vec![0.0; rank]);
+        if let Some(state) = state {
+            coefficients[..state.coefficients.len()].copy_from_slice(&state.coefficients);
+        }
         let mut previous_coefficients = coefficients.clone();
-        let mut r = self
-            .config
-            .initial_rotation
-            .clone()
-            .unwrap_or_else(|| DMatrix::identity(d, d));
+        let mut r = self.config.initial_rotation.clone().unwrap_or_else(|| {
+            state.map_or_else(|| DMatrix::identity(d, d), |s| s.rotation.clone())
+        });
+        let scale_bounds = if self.config.with_scale {
+            self.config.scale_bounds
+        } else {
+            None
+        };
         let mut scale = if self.config.with_scale {
-            self.config.initial_scale
+            clamp_scale(
+                state.map_or(self.config.initial_scale, |s| s.scale),
+                scale_bounds,
+            )
         } else {
             1.0
         };
@@ -350,8 +448,8 @@ impl<'a> AtlasRegistration<'a> {
             .config
             .initial_translation
             .clone()
-            .unwrap_or_else(|| vec![0.0; d]);
-        if self.config.normalize && self.config.initial_translation.is_some() {
+            .unwrap_or_else(|| state.map_or_else(|| vec![0.0; d], |s| s.translation.clone()));
+        if self.config.normalize && (self.config.initial_translation.is_some() || state.is_some()) {
             let tw = t.clone();
             for j in 0..d {
                 t[j] = (scale * (0..d).map(|q| centroid[q] * r[(q, j)]).sum::<f64>() + tw[j]
@@ -362,7 +460,17 @@ impl<'a> AtlasRegistration<'a> {
         let mut deformed = add_deformation(&y, &modes, &coefficients);
         let mut ty = DMatrix::zeros(m, d);
         apply_similarity(&deformed, &r, scale, &t, &mut ty);
-        let mut sigma2 = self.config.em.sigma2.unwrap_or(initialize_sigma2(&x, &y)?);
+        // Initialize the variance from the *posed* model `ty`, not the raw
+        // mean: with an initial rotation/translation/coefficients the mean
+        // sits somewhere else entirely and the pairwise spread would be off
+        // by the frame offset (badly inflating the start of the annealing).
+        let mut sigma2 = match self.config.em.sigma2 {
+            Some(value) => value,
+            None => match state {
+                Some(state) => state.sigma2 / target_scale.powi(2),
+                None => initialize_sigma2(&x, &ty)?,
+            },
+        };
         let extent2: f64 = (0..d)
             .map(|j| {
                 let lo = (0..x.nrows())
@@ -425,6 +533,24 @@ impl<'a> AtlasRegistration<'a> {
         let mut diff = f64::INFINITY;
         let mut iterations = 0;
         let mut last_nll = f64::INFINITY;
+        let outlier_density = state.map_or_else(
+            || 1.0 / (x.nrows() as f64 * target_scale.powi(d as i32)),
+            |s| s.outlier_density,
+        );
+        let working_em = EmConfig {
+            outlier_weight: if state.is_some() {
+                effective_outlier_weight(
+                    self.config.em.outlier_weight,
+                    outlier_density,
+                    x.nrows(),
+                    target_scale,
+                    d,
+                )
+            } else {
+                self.config.em.outlier_weight
+            },
+            ..self.config.em.clone()
+        };
         let sparse_index = self.config.em.k.map(|k| SparseIndex::new(&x, k));
         // Adaptive sparse switch: with `kdtree_radius_scale = Some(scale)`
         // the E-step stays dense until `sigma2 < (‖extent(X)‖ / scale)²`,
@@ -441,27 +567,60 @@ impl<'a> AtlasRegistration<'a> {
         // on whether an index is passed).
         let dense_em = EmConfig {
             k: None,
-            ..self.config.em.clone()
+            ..working_em.clone()
         };
         // Per-iteration scratch, allocated once and overwritten each pass to
         // avoid re-allocating on every EM step (pose initialization runs
         // this loop hundreds of times).
         let mut residual_matrix = DMatrix::zeros(m * d, 1);
         let mut scaled_modes = modes.clone();
+        // Adaptive mixing: `pi` are the proportions (sum to 1), `mixing`
+        // the relative factors `M·pi` the E-step consumes. A fresh fit starts
+        // uniform; a continuation transfers the previously fitted mixture.
+        let mut pi = match state {
+            Some(state) => state.mixing_weights_on(self.mean)?,
+            None => None,
+        }
+        .or_else(|| self.config.adaptive_mixing.map(|_| vec![1.0 / m as f64; m]));
+        let mut mixing = mixing_factors(pi.as_deref());
         while iterations < self.config.em.max_iterations && diff > self.config.em.tolerance {
             if !sparse_active && sparse_threshold.is_some_and(|threshold| sigma2 < threshold) {
                 sparse_active = true;
             }
             let (em, active_index) = if sparse_active {
-                (&self.config.em, sparse_index.as_ref())
+                (&working_em, sparse_index.as_ref())
             } else {
                 (&dense_em, None)
             };
-            let mut stats = posterior_stats(&x, &ty, sigma2, em, false, active_index);
+            let mut stats = posterior_stats_weighted(
+                &x,
+                &ty,
+                sigma2,
+                em,
+                false,
+                active_index,
+                mixing.as_deref(),
+            );
             if stats.np <= f64::MIN_POSITIVE {
                 return Err(Error::SingularSystem);
             }
             last_nll = stats.negative_log_likelihood;
+            // M-step for the mixing proportions, from the surface posterior
+            // mass only (before any landmark augmentation below):
+            // `pi_m = (p1_m + alpha) / (Np + M·alpha)`.
+            if let (Some(alpha), Some(pi), Some(mixing)) =
+                (self.config.adaptive_mixing, pi.as_mut(), mixing.as_mut())
+            {
+                let total = stats.np + alpha * m as f64;
+                for ((proportion, factor), &mass) in
+                    pi.iter_mut().zip(mixing.iter_mut()).zip(&stats.p1)
+                {
+                    *proportion = (mass + alpha) / total;
+                    // Relative factor for the next E-step, floored so the
+                    // truncated path always has a finite weight range.
+                    *factor = (*proportion * m as f64).max(1e-9);
+                }
+            }
             // Anchored-keypoint term: fold each landmark into the sufficient
             // statistics as a virtual correspondence between source vertex
             // `index` and its known target point `q`. It then flows into both
@@ -541,6 +700,7 @@ impl<'a> AtlasRegistration<'a> {
                     stats.np,
                     self.config.with_scale,
                     scale,
+                    scale_bounds,
                 )?;
                 r = nr;
                 scale = ns;
@@ -654,7 +814,19 @@ impl<'a> AtlasRegistration<'a> {
             difference: diff,
             negative_log_likelihood: last_nll,
             landmark_rms,
+            mixing_reference: pi.as_ref().map(|_| self.mean.clone()),
+            mixing_weights: pi,
+            outlier_weight: self.config.em.outlier_weight,
+            outlier_density,
         })
+    }
+}
+
+/// Clamp `scale` into optional `(min, max)` bounds.
+fn clamp_scale(scale: f64, bounds: Option<(f64, f64)>) -> f64 {
+    match bounds {
+        Some((low, high)) => scale.clamp(low, high),
+        None => scale,
     }
 }
 
@@ -724,6 +896,7 @@ fn weighted_similarity(
     total: f64,
     with_scale: bool,
     current_scale: f64,
+    scale_bounds: Option<(f64, f64)>,
 ) -> Result<(DMatrix<f64>, f64, Vec<f64>)> {
     let d = y.ncols();
     let mux: Vec<_> = (0..d)
@@ -761,7 +934,7 @@ fn weighted_similarity(
         let spread_floor = (64.0 * (y.nrows() * d) as f64 * (f64::EPSILON * max_abs_y).powi(2))
             .max(f64::MIN_POSITIVE);
         if denominator > spread_floor {
-            numerator / denominator
+            clamp_scale(numerator / denominator, scale_bounds)
         } else {
             current_scale
         }
@@ -1233,5 +1406,199 @@ mod landmark_tests {
             tight.sigma2,
             base.sigma2
         );
+    }
+}
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::{AtlasConfig, AtlasRegistration};
+    use crate::EmConfig;
+    use nalgebra::DMatrix;
+
+    /// A rod-like model: 60 points along x with a small helical wobble.
+    fn rod(count: usize) -> DMatrix<f64> {
+        DMatrix::from_fn(count, 3, |i, j| {
+            let z = i as f64 / (count - 1) as f64; // 0..1
+            match j {
+                0 => 4.0 * z,
+                1 => 0.25 * (7.0 * z).sin(),
+                _ => 0.25 * (7.0 * z).cos(),
+            }
+        })
+    }
+
+    fn em(iterations: usize) -> EmConfig {
+        EmConfig {
+            max_iterations: iterations,
+            tolerance: 0.0,
+            outlier_weight: 0.05,
+            parallel: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn adaptive_mixing_is_classic_cpd_when_disabled_and_switches_off_unobserved_points() {
+        let model = rod(60);
+        let modes = DMatrix::zeros(model.len(), 1);
+        // Target: the first third of the rod, already in place.
+        let target = DMatrix::from_fn(20, 3, |i, j| model[(i, j)]);
+
+        let classic = AtlasRegistration::new(
+            &target,
+            &model,
+            &modes,
+            AtlasConfig {
+                em: em(15),
+                eigenvalues: vec![1.0],
+                optimize_similarity: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .register()
+        .unwrap();
+        assert!(classic.mixing_weights.is_none());
+
+        let adaptive = AtlasRegistration::new(
+            &target,
+            &model,
+            &modes,
+            AtlasConfig {
+                em: em(15),
+                eigenvalues: vec![1.0],
+                optimize_similarity: false,
+                adaptive_mixing: Some(0.01),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .register()
+        .unwrap();
+        let pi = adaptive
+            .mixing_weights
+            .expect("adaptive mixing reports proportions");
+        assert_eq!(pi.len(), 60);
+        assert!(
+            (pi.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+            "pi must sum to 1"
+        );
+        assert!(
+            pi.iter().all(|&v| v > 0.0),
+            "Dirichlet floor keeps pi positive"
+        );
+        let observed: f64 = pi[..20].iter().sum();
+        let unobserved: f64 = pi[20..].iter().sum();
+        assert!(
+            observed > 0.9 && unobserved < 0.1,
+            "unobserved points should switch off: observed={observed} unobserved={unobserved}"
+        );
+        // The fit itself is unaffected by the mixing (points are already in
+        // place; nothing to move), so the surface variance stays tiny.
+        assert!(adaptive.sigma2 < 1e-3, "sigma2={}", adaptive.sigma2);
+    }
+
+    #[test]
+    fn scale_bounds_are_enforced_on_start_and_estimates() {
+        let model = rod(60);
+        let modes = DMatrix::zeros(model.len(), 1);
+        // A fragment target at the far end, with the model mis-placed and
+        // free scale allowed: the unbounded fit shrinks the model.
+        let target = DMatrix::from_fn(20, 3, |i, j| model[(i + 40, j)]);
+        let base = AtlasConfig {
+            em: em(30),
+            eigenvalues: vec![1.0],
+            with_scale: true,
+            initial_scale: 0.3,
+            ..Default::default()
+        };
+        let bounded = AtlasRegistration::new(
+            &target,
+            &model,
+            &modes,
+            AtlasConfig {
+                scale_bounds: Some((0.9, 1.1)),
+                ..base.clone()
+            },
+        )
+        .unwrap()
+        .register()
+        .unwrap();
+        assert!(
+            (0.9..=1.1).contains(&bounded.scale),
+            "scale {} left the bounds",
+            bounded.scale
+        );
+
+        // Invalid bounds are rejected.
+        for bad in [(0.0, 1.0), (1.2, 0.8), (f64::NAN, 1.0)] {
+            let err = AtlasRegistration::new(
+                &target,
+                &model,
+                &modes,
+                AtlasConfig {
+                    scale_bounds: Some(bad),
+                    ..base.clone()
+                },
+            )
+            .err();
+            assert!(err.is_some(), "bounds {bad:?} should be rejected");
+        }
+        // Negative alpha is rejected too.
+        assert!(
+            AtlasRegistration::new(
+                &target,
+                &model,
+                &modes,
+                AtlasConfig {
+                    adaptive_mixing: Some(-1.0),
+                    ..base
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn initial_sigma2_follows_the_posed_model() {
+        // Model far from the target in its own frame, but an initial
+        // translation puts it right on top. With sigma2 initialized from the
+        // posed model the variance anneals to the point spacing within a few
+        // iterations; from the raw mean it would start ~4000× too soft (the
+        // 1-D rod contracts sigma2 by only ~3× per iteration) and fail this.
+        let model = rod(60);
+        let modes = DMatrix::zeros(model.len(), 1);
+        let offset = [100.0, -50.0, 25.0];
+        let target = DMatrix::from_fn(60, 3, |i, j| model[(i, j)] + offset[j]);
+        let result = AtlasRegistration::new(
+            &target,
+            &model,
+            &modes,
+            AtlasConfig {
+                em: EmConfig {
+                    max_iterations: 8,
+                    tolerance: 0.0,
+                    parallel: false,
+                    ..Default::default()
+                },
+                eigenvalues: vec![1.0],
+                with_scale: false,
+                initial_translation: Some(offset.to_vec()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .register()
+        .unwrap();
+        assert!(result.sigma2 < 1e-2, "sigma2={}", result.sigma2);
+        let rms = (result
+            .points
+            .iter()
+            .zip(target.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f64>()
+            / target.len() as f64)
+            .sqrt();
+        assert!(rms < 1e-2, "rms={rms}");
     }
 }

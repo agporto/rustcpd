@@ -374,6 +374,31 @@ pub(crate) fn posterior_stats(
     store_p: bool,
     sparse_index: Option<&SparseIndex>,
 ) -> PosteriorStats {
+    posterior_stats_weighted(x, ty, sigma2, config, store_p, sparse_index, None)
+}
+
+/// E-step with optional per-source mixing weights.
+///
+/// `source_weights`, when given, holds one strictly positive factor per
+/// source point, expressed *relative to uniform*: `M·π_m` where `π_m` are
+/// the mixing proportions (so a vector of ones reproduces classic CPD's
+/// `1/M`). Each Gaussian kernel is multiplied by its factor before the
+/// per-target normalization, and the uniform-outlier constant is left
+/// untouched because it is already stated relative to `1/M`. Every path —
+/// dense, single-precision, truncated, and k-NN sparse — applies the same
+/// factors, so the choice of path never changes the answer beyond
+/// rounding. The truncation radius widens by `2σ²·ln(max/min)` of the
+/// weights so no non-negligible weighted term is pruned.
+pub(crate) fn posterior_stats_weighted(
+    x: &DMatrix<f64>,
+    ty: &DMatrix<f64>,
+    sigma2: f64,
+    config: &EmConfig,
+    store_p: bool,
+    sparse_index: Option<&SparseIndex>,
+    source_weights: Option<&[f64]>,
+) -> PosteriorStats {
+    debug_assert!(source_weights.is_none_or(|w| w.len() == ty.nrows()));
     if config.k.is_none() {
         // Once σ² is small relative to the cloud extent, most Gaussian
         // terms fall below f64 resolution and an anchored range search
@@ -396,6 +421,7 @@ pub(crate) fn posterior_stats(
                     store_p,
                     config.parallel,
                     config.single_precision,
+                    source_weights,
                 ),
                 _ => posterior_stats_truncated::<3>(
                     x,
@@ -405,6 +431,7 @@ pub(crate) fn posterior_stats(
                     store_p,
                     config.parallel,
                     config.single_precision,
+                    source_weights,
                 ),
             };
             if let Some(stats) = attempt {
@@ -419,6 +446,7 @@ pub(crate) fn posterior_stats(
                 config.outlier_weight,
                 store_p,
                 config.parallel,
+                source_weights,
             );
         }
         return posterior_stats_dense(
@@ -428,6 +456,7 @@ pub(crate) fn posterior_stats(
             config.outlier_weight,
             store_p,
             config.parallel,
+            source_weights,
         );
     }
     let index = sparse_index.expect("sparse posterior requires a prebuilt index");
@@ -439,7 +468,25 @@ pub(crate) fn posterior_stats(
         index,
         store_p,
         config.parallel,
+        source_weights,
     )
+}
+
+/// `ln(max / min)` of a strictly positive weight vector, or `None` when the
+/// weights are unusable for a truncation bound (non-finite or non-positive).
+fn weight_log_ratio(weights: &[f64]) -> Option<f64> {
+    let (mut low, mut high) = (f64::INFINITY, 0.0_f64);
+    for &w in weights {
+        if !w.is_finite() || w <= 0.0 {
+            return None;
+        }
+        low = low.min(w);
+        high = high.max(w);
+    }
+    if low == f64::INFINITY {
+        return Some(0.0);
+    }
+    Some((high / low).ln())
 }
 
 fn build_kd_tree<const K: usize>(x: &DMatrix<f64>) -> KdTree<f64, K> {
@@ -499,6 +546,7 @@ fn brute_edges(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn posterior_stats_sparse(
     x: &DMatrix<f64>,
     ty: &DMatrix<f64>,
@@ -507,6 +555,7 @@ fn posterior_stats_sparse(
     sparse_index: &SparseIndex,
     store_p: bool,
     parallel: bool,
+    weights: Option<&[f64]>,
 ) -> PosteriorStats {
     let (n, m, d) = (x.nrows(), ty.nrows(), x.ncols());
     let mut edges = match &sparse_index.index {
@@ -520,9 +569,10 @@ fn posterior_stats_sparse(
         * m as f64
         / n as f64;
     let mut denominator = vec![outlier; n];
-    for row in &mut edges {
+    for (source, row) in edges.iter_mut().enumerate() {
+        let factor = weights.map_or(1.0, |w| w[source]);
         for (target, squared) in row {
-            *squared = (-*squared / (2.0 * sigma2)).exp();
+            *squared = (-*squared / (2.0 * sigma2)).exp() * factor;
             denominator[*target] += *squared;
         }
     }
@@ -596,6 +646,7 @@ fn posterior_stats_dense(
     w: f64,
     store_p: bool,
     parallel: bool,
+    weights: Option<&[f64]>,
 ) -> PosteriorStats {
     let (n, m, d) = (x.nrows(), ty.nrows(), x.ncols());
     let outlier = (2.0 * std::f64::consts::PI * sigma2).powf(d as f64 / 2.0) * w / (1.0 - w)
@@ -628,6 +679,7 @@ fn posterior_stats_dense(
                 sigma2,
                 outlier,
                 (start, end),
+                weights,
             ),
             3 => dense_block_pass::<3>(
                 &mut block,
@@ -638,6 +690,7 @@ fn posterior_stats_dense(
                 sigma2,
                 outlier,
                 (start, end),
+                weights,
             ),
             _ => dense_block_pass_dynamic(
                 &mut block,
@@ -648,6 +701,7 @@ fn posterior_stats_dense(
                 sigma2,
                 outlier,
                 (start, end),
+                weights,
             ),
         }
         block
@@ -659,6 +713,18 @@ fn posterior_stats_dense(
         ranges.iter().map(process).collect()
     };
     combine_blocks(blocks, n, m, d, sigma2, store_p)
+}
+
+/// Multiply each kernel value by its source's mixing factor (no-op when
+/// `weights` is `None`). Applied after the exponential and before the
+/// per-target normalization, identically on every E-step path.
+#[inline(always)]
+fn apply_source_weights(buffer: &mut [f64], weights: Option<&[f64]>) {
+    if let Some(weights) = weights {
+        for (value, &factor) in buffer.iter_mut().zip(weights) {
+            *value *= factor;
+        }
+    }
 }
 
 /// Sum with eight independent accumulators in a fixed order: breaks the
@@ -715,6 +781,7 @@ fn dense_block_pass<const D: usize>(
     sigma2: f64,
     outlier: f64,
     (start, end): (usize, usize),
+    weights: Option<&[f64]>,
 ) {
     let m = buffer.len();
     let columns: [&[f64]; D] = std::array::from_fn(|q| &ty_data[q * m..(q + 1) * m]);
@@ -733,6 +800,7 @@ fn dense_block_pass<const D: usize>(
             *value = -squared / (2.0 * sigma2);
         }
         exp_non_positive(buffer);
+        apply_source_weights(buffer, weights);
         let sum = unrolled_sum(buffer);
         let denominator = (outlier + sum).max(f64::MIN_POSITIVE);
         let inverse = denominator.recip();
@@ -764,12 +832,16 @@ fn posterior_stats_dense_f32(
     w: f64,
     store_p: bool,
     parallel: bool,
+    weights: Option<&[f64]>,
 ) -> PosteriorStats {
     let (n, m, d) = (x.nrows(), ty.nrows(), x.ncols());
     let outlier = (2.0 * std::f64::consts::PI * sigma2).powf(d as f64 / 2.0) * w / (1.0 - w)
         * m as f64
         / n as f64;
     let ty32: Vec<f32> = ty.as_slice().iter().map(|&value| value as f32).collect();
+    let weights32: Option<Vec<f32>> =
+        weights.map(|values| values.iter().map(|&value| value as f32).collect());
+    let weights32 = weights32.as_deref();
     let source_squared: Vec<f32> = (0..m)
         .map(|i| (0..d).map(|q| ty32[q * m + i] * ty32[q * m + i]).sum())
         .collect();
@@ -793,6 +865,7 @@ fn posterior_stats_dense_f32(
                 sigma2,
                 outlier,
                 (start, end),
+                weights32,
             ),
             _ => dense_block_pass_f32::<3>(
                 &mut block,
@@ -803,6 +876,7 @@ fn posterior_stats_dense_f32(
                 sigma2,
                 outlier,
                 (start, end),
+                weights32,
             ),
         }
         block
@@ -828,6 +902,7 @@ fn dense_block_pass_f32<const D: usize>(
     sigma2: f64,
     outlier: f64,
     (start, end): (usize, usize),
+    weights: Option<&[f32]>,
 ) {
     let m = buffer.len();
     let columns: [&[f32]; D] = std::array::from_fn(|q| &ty32[q * m..(q + 1) * m]);
@@ -848,6 +923,11 @@ fn dense_block_pass_f32<const D: usize>(
             *value = squared * inverse_variance;
         }
         exp_non_positive_f32(buffer);
+        if let Some(weights) = weights {
+            for (value, &factor) in buffer.iter_mut().zip(weights) {
+                *value *= factor;
+            }
+        }
         let sum = unrolled_sum_f32(buffer);
         let denominator = (outlier + sum).max(f64::MIN_POSITIVE);
         let inverse = denominator.recip();
@@ -880,6 +960,7 @@ fn dense_block_pass_dynamic(
     sigma2: f64,
     outlier: f64,
     (start, end): (usize, usize),
+    weights: Option<&[f64]>,
 ) {
     let m = buffer.len();
     let dims = ty_data.len() / m;
@@ -908,6 +989,7 @@ fn dense_block_pass_dynamic(
             *value = -squared / (2.0 * sigma2);
         }
         exp_non_positive(buffer);
+        apply_source_weights(buffer, weights);
         let sum = unrolled_sum(buffer);
         let denominator = (outlier + sum).max(f64::MIN_POSITIVE);
         let inverse = denominator.recip();
@@ -1013,6 +1095,7 @@ fn bounding_box_diagonal_squared(points: &DMatrix<f64>) -> f64 {
 /// Returns `None` when a deterministic probe of evenly spaced targets
 /// finds the active set still too large for range queries to beat the
 /// streaming dense path.
+#[allow(clippy::too_many_arguments)]
 fn posterior_stats_truncated<const K: usize>(
     x: &DMatrix<f64>,
     ty: &DMatrix<f64>,
@@ -1021,13 +1104,23 @@ fn posterior_stats_truncated<const K: usize>(
     store_p: bool,
     parallel: bool,
     single_precision: bool,
+    weights: Option<&[f64]>,
 ) -> Option<PosteriorStats> {
     let (n, m, d) = (x.nrows(), ty.nrows(), x.ncols());
     let outlier = (2.0 * std::f64::consts::PI * sigma2).powf(d as f64 / 2.0) * w / (1.0 - w)
         * m as f64
         / n as f64;
+    // With mixing weights the dominant term of a column may belong to a
+    // low-weight source while a heavier source sits farther away, so the
+    // "invisible beyond the margin" bound must absorb the weight range.
+    // Degenerate weights (non-positive / non-finite) make no such bound
+    // possible; fall back to the streaming dense path.
+    let weight_margin = match weights {
+        Some(values) => 2.0 * sigma2 * weight_log_ratio(values)?,
+        None => 0.0,
+    };
     let tree = build_kd_tree::<K>(ty);
-    let margin = truncation_margin(sigma2, m, single_precision);
+    let margin = truncation_margin(sigma2, m, single_precision) + weight_margin;
     // Probe 32 evenly spaced targets; if the mean active fraction is
     // above ~15%, per-hit traversal overhead outweighs the skipped work.
     let probes = 32.min(n);
@@ -1068,6 +1161,11 @@ fn posterior_stats_truncated<const K: usize>(
                 values.push(-hit.distance / (2.0 * sigma2));
             }
             exp_non_positive(&mut values);
+            if let Some(weights) = weights {
+                for (edge, value) in block.edges[first_edge..].iter().zip(values.iter_mut()) {
+                    *value *= weights[edge.0 as usize];
+                }
+            }
             let mut denominator = outlier;
             for &value in values.iter() {
                 denominator += value;
@@ -1162,10 +1260,18 @@ mod tests {
         let ty = DMatrix::from_fn(count, D, |i, j| x[(i, j)] + 0.005 * (j + 1) as f64);
         let sigma2 = 0.002;
         let outlier_weight = 0.1;
-        let dense = posterior_stats_dense(&x, &ty, sigma2, outlier_weight, true, false);
-        let truncated =
-            posterior_stats_truncated::<D>(&x, &ty, sigma2, outlier_weight, true, false, false)
-                .expect("test cloud must select the truncated path");
+        let dense = posterior_stats_dense(&x, &ty, sigma2, outlier_weight, true, false, None);
+        let truncated = posterior_stats_truncated::<D>(
+            &x,
+            &ty,
+            sigma2,
+            outlier_weight,
+            true,
+            false,
+            false,
+            None,
+        )
+        .expect("test cloud must select the truncated path");
 
         const TOLERANCE: f64 = 1e-10;
         const NLL_TOLERANCE: f64 = 1e-8;
@@ -1197,5 +1303,93 @@ mod tests {
     #[test]
     fn truncated_estep_matches_dense_in_three_dimensions() {
         truncated_matches_dense::<3>();
+    }
+
+    /// Per-source mixing weights must be applied identically on every
+    /// E-step path: dense f64, dense f32 (to single precision), truncated,
+    /// and k-NN sparse (with k = M so it is exact).
+    #[test]
+    fn weighted_estep_paths_agree() {
+        let count = 96;
+        let x = DMatrix::from_fn(count, 3, |i, j| {
+            let z = i as f64;
+            match j {
+                0 => 1.25 * z,
+                1 => (0.17 * z).sin(),
+                _ => (0.11 * z).cos(),
+            }
+        });
+        let ty = DMatrix::from_fn(count, 3, |i, j| x[(i, j)] + 0.005 * (j + 1) as f64);
+        let sigma2 = 0.002;
+        let outlier_weight = 0.1;
+        // Weights spanning two orders of magnitude, mean ≈ 1.
+        let weights: Vec<f64> = (0..count)
+            .map(|i| 0.05 + 2.0 * ((0.3 * i as f64).sin().abs()))
+            .collect();
+        let dense =
+            posterior_stats_dense(&x, &ty, sigma2, outlier_weight, true, false, Some(&weights));
+        // Weights redistribute mass but never create or destroy it: the
+        // per-target inlier mass still sums to Np, and heavier sources
+        // must end up with more mass than uniform weighting gives them.
+        let uniform = posterior_stats_dense(&x, &ty, sigma2, outlier_weight, true, false, None);
+        assert!((dense.pt1.iter().sum::<f64>() - dense.np).abs() < 1e-9);
+        let heaviest = (0..count)
+            .max_by(|&a, &b| weights[a].total_cmp(&weights[b]))
+            .unwrap();
+        assert!(dense.p1[heaviest] >= uniform.p1[heaviest]);
+
+        let truncated = posterior_stats_truncated::<3>(
+            &x,
+            &ty,
+            sigma2,
+            outlier_weight,
+            true,
+            false,
+            false,
+            Some(&weights),
+        )
+        .expect("test cloud must select the truncated path");
+        assert_slice_close(&truncated.pt1, &dense.pt1, 1e-10, "pt1");
+        assert_slice_close(&truncated.p1, &dense.p1, 1e-10, "p1");
+        assert_slice_close(truncated.px.as_slice(), dense.px.as_slice(), 1e-10, "px");
+        assert!((truncated.negative_log_likelihood - dense.negative_log_likelihood).abs() <= 1e-8);
+
+        let single = posterior_stats_dense_f32(
+            &x,
+            &ty,
+            sigma2,
+            outlier_weight,
+            false,
+            false,
+            Some(&weights),
+        );
+        assert_slice_close(&single.p1, &dense.p1, 2e-3, "p1 (f32)");
+        assert_slice_close(&single.pt1, &dense.pt1, 2e-3, "pt1 (f32)");
+
+        let index = SparseIndex::new(&x, count);
+        let sparse = posterior_stats_sparse(
+            &x,
+            &ty,
+            sigma2,
+            outlier_weight,
+            &index,
+            false,
+            false,
+            Some(&weights),
+        );
+        assert_slice_close(&sparse.p1, &dense.p1, 1e-10, "p1 (sparse)");
+        assert_slice_close(&sparse.pt1, &dense.pt1, 1e-10, "pt1 (sparse)");
+        assert_slice_close(
+            sparse.px.as_slice(),
+            dense.px.as_slice(),
+            1e-10,
+            "px (sparse)",
+        );
+
+        // A vector of ones is exactly classic CPD.
+        let ones = vec![1.0; count];
+        let unit =
+            posterior_stats_dense(&x, &ty, sigma2, outlier_weight, false, false, Some(&ones));
+        assert_slice_close(&unit.p1, &uniform.p1, 1e-15, "p1 (unit weights)");
     }
 }

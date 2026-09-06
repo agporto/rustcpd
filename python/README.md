@@ -101,6 +101,24 @@ match.probability    # (M,) confidence in [0, 1]
 match.posterior      # (M, N) full soft assignment matrix
 ```
 
+**Continue pose initialization without reheating a fragment fit.** Pass the
+complete state and retain the same model/EM options:
+
+```python
+common = dict(with_scale=False, adaptive_mixing=1.0, outlier_weight=0.05,
+              lambda_regularization=0.1)
+init = cpd.pose_initialize(mean, partial_target, modes, eigenvalues,
+                           translation_anchor_count=6, **common)
+fit = cpd.register_atlas(partial_target, mean, modes, eigenvalues,
+                         initial_state=init.state, normalize=True, **common)
+```
+
+Both `init.state` and `fit.state` contain the pose, shape coefficients, variance,
+and mixture. Variance uses original target units and is converted automatically
+when the receiving fit normalizes its inputs. Individual initial-pose arguments
+cannot be combined with `initial_state`. Saved mixture weights remain active
+but fixed if `adaptive_mixing` is omitted in the next call.
+
 **Complete a partial shape and get per-point uncertainty.** The atlas is a
 linear-Gaussian shape model, so a partial observation yields a closed-form
 posterior over its coefficients:
@@ -118,6 +136,13 @@ Visibility is inferred from the fitted correspondence; the optional
 observed). Calibrate the uncertainty to nominal coverage with the
 `rustcpd.calibration` submodule (split-conformal). None of
 this touches the complete-data registration paths.
+
+`posterior()` uses the fitted variance and mixture, including adaptive weights.
+Its `outlier_weight=None` default inherits the fit's outlier model; explicitly
+pass `0.0` for clean assignments. Weights transfer to a reordered or denser mean
+by nearest-neighbor interpolation of occupancies and renormalization, assuming
+comparable surface sampling. `prior_temperature` still defaults to `1.0`; use
+the fitted `lambda_regularization` when you want the same shape-prior strength.
 
 Shared keyword arguments on every registration: `sigma2` (initial
 variance; estimated when omitted), `max_iterations` (default 100),

@@ -21,12 +21,13 @@
 //!
 //! # Prior temperature
 //!
-//! The atlas `lambda_regularization` is a prior *temperature*: the atlas
+//! The atlas `lambda_regularization` multiplies the prior precision: the atlas
 //! M-step equals the true Bayesian posterior mean only when it is `1`.
 //! Completion uses the statistically correct prior (`temperature = 1`) by
-//! default; set [`PosteriorOptions::prior_temperature`] to match a tempered
-//! fit if you need the completion point estimate to reproduce
-//! `AtlasResult::coefficients` exactly.
+//! default; set [`PosteriorOptions::prior_temperature`] (the legacy name for
+//! this precision multiplier) to the fitted `lambda_regularization` for the
+//! same shape prior. Coefficient agreement additionally requires convergence
+//! and identical conditioning information, including any visibility filtering.
 //!
 //! # Discrepancy (model inadequacy)
 //!
@@ -43,7 +44,10 @@
 
 use nalgebra::DMatrix;
 
-use crate::em::{EmConfig, posterior_stats, validate_clouds};
+use crate::atlas_state::{
+    MixingWeightMap, effective_outlier_weight, mixing_factors, validate_mixing_weights,
+};
+use crate::em::{EmConfig, posterior_stats_weighted, validate_clouds};
 use crate::{AtlasResult, Error, Result};
 
 /// Options controlling how a [`ShapePosterior`] is built from a fit.
@@ -58,11 +62,14 @@ pub struct PosteriorOptions {
     /// Absolute posterior-mass floor below which a model point is treated
     /// as unobserved (used only when `completeness` is `None`).
     pub visibility_floor: f64,
-    /// Prior temperature (see module docs). `1.0` is the true prior.
+    /// Prior precision multiplier (legacy name; see module docs). `1.0` is
+    /// the original shape prior; `lambda_regularization` matches the fit's
+    /// prior strength. Precision is `prior_temperature * Λ⁻¹`.
     pub prior_temperature: f64,
-    /// Uniform-outlier weight used when recomputing the correspondence for
-    /// the posterior. `0.0` is a clean soft assignment.
-    pub outlier_weight: f64,
+    /// Override the fitted outlier weight when forming the posterior.
+    /// `None` inherits the registration's observation model; `Some(0.0)`
+    /// explicitly requests clean soft assignments.
+    pub outlier_weight: Option<f64>,
     /// Estimate a model-inadequacy (discrepancy) variance from the observed
     /// region and fold it into the predictive uncertainty. This guards
     /// against overconfidence when the shape model cannot represent what
@@ -77,7 +84,7 @@ impl Default for PosteriorOptions {
             completeness: None,
             visibility_floor: 1e-6,
             prior_temperature: 1.0,
-            outlier_weight: 0.0,
+            outlier_weight: None,
             estimate_discrepancy: true,
         }
     }
@@ -394,7 +401,7 @@ pub fn complete_shape(
     let mut precision = scaled_modes.tr_mul(&scaled_modes); // Uᵀ W U (k×k)
     precision /= sigma_eff2;
     for a in 0..k {
-        precision[(a, a)] += 1.0 / (prior_temperature * eigenvalues[a]);
+        precision[(a, a)] += prior_temperature / eigenvalues[a];
     }
     let rhs = modes.tr_mul(&weighted_residual) / sigma_eff2; // (k×1)
 
@@ -475,45 +482,58 @@ impl AtlasResult {
         if self.rotation.shape() != (d, d) {
             return Err(Error::InvalidShape("rotation"));
         }
-        if !(0.0..1.0).contains(&options.outlier_weight) {
+        let outlier_weight = options.outlier_weight.unwrap_or(self.outlier_weight);
+        if !(0.0..1.0).contains(&outlier_weight) {
             return Err(Error::InvalidOutlierWeight);
+        }
+        if !self.sigma2.is_finite() || self.sigma2 <= 0.0 {
+            return Err(Error::PositiveParameter("sigma2"));
+        }
+        if !self.outlier_density.is_finite() || self.outlier_density <= 0.0 {
+            return Err(Error::PositiveParameter("outlier_density"));
         }
 
         // Deformed + posed model in the target frame (the converged fit at
         // this resolution).
         let ty = self.reconstruct(mean, modes)?;
 
-        // Self-consistent target-frame noise variance and correspondence for
-        // the fixed fit: iterate the σ² fixed point a few times (converges
-        // immediately since `ty` is fixed). Independent of whether the fit
-        // used `normalize`, so no hidden frame assumptions.
+        // Condition on the fitted observation model. Reinitializing sigma2
+        // from all pairs reheats fragment fits; uniform weights also discard
+        // the occupancy model learned by adaptive registration. Transfer the
+        // relative occupancies only when the model sampling has changed.
+        let pi = match (&self.mixing_weights, &self.mixing_reference) {
+            (Some(weights), Some(reference)) => {
+                validate_mixing_weights(weights)?;
+                if weights.len() != reference.nrows() {
+                    return Err(Error::InvalidShape("mixing_weights"));
+                }
+                Some(MixingWeightMap::new(reference, mean)?.apply(weights))
+            }
+            (Some(_), None) => return Err(Error::InvalidShape("mixing_reference")),
+            _ => None,
+        };
+        let mixing = mixing_factors(pi.as_deref());
         let config = EmConfig {
-            outlier_weight: options.outlier_weight,
+            outlier_weight: effective_outlier_weight(
+                outlier_weight,
+                self.outlier_density,
+                target.nrows(),
+                1.0,
+                d,
+            ),
             k: None,
             ..EmConfig::default()
         };
-        let mut sigma2 = crate::initialize_sigma2(target, &ty)?;
-        let mut stats = posterior_stats(target, &ty, sigma2, &config, false, None);
-        for _ in 0..6 {
-            let np = stats.np.max(f64::MIN_POSITIVE);
-            let xpx: f64 = (0..target.nrows())
-                .map(|i| stats.pt1[i] * (0..d).map(|j| target[(i, j)].powi(2)).sum::<f64>())
-                .sum();
-            let ypy: f64 = (0..m)
-                .map(|i| stats.p1[i] * (0..d).map(|j| ty[(i, j)].powi(2)).sum::<f64>())
-                .sum();
-            let cross: f64 = (0..m)
-                .map(|i| (0..d).map(|j| ty[(i, j)] * stats.px[(i, j)]).sum::<f64>())
-                .sum();
-            let next = ((xpx - 2.0 * cross + ypy) / (np * d as f64)).max(f64::MIN_POSITIVE);
-            if (next - sigma2).abs() <= 1e-12 * sigma2.max(1.0) {
-                sigma2 = next;
-                break;
-            }
-            sigma2 = next;
-            stats = posterior_stats(target, &ty, sigma2, &config, false, None);
-        }
-        let sigma_eff2 = (sigma2 / (self.scale * self.scale)).max(f64::MIN_POSITIVE);
+        let stats = posterior_stats_weighted(
+            target,
+            &ty,
+            self.sigma2,
+            &config,
+            false,
+            None,
+            mixing.as_deref(),
+        );
+        let sigma_eff2 = (self.sigma2 / (self.scale * self.scale)).max(f64::MIN_POSITIVE);
 
         // Per-model-point observed position (target frame) = px/p1, inverse
         // posed to the model frame; residual against the mean; weight = p1.

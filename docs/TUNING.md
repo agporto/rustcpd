@@ -146,12 +146,93 @@ to points beyond the ones registered:
   `result.apply_similarity(z)` applies only the recovered rotation, scale,
   and translation to arbitrary points, ignoring the shape deformation.
 
+## Pose search on partial objects
+
+The default pose search seeds every rotation with the model centroid on the
+target centroid. When the target is a fragment that sits away from the
+model's centre (a proximal third, a distal end), the correct pose needs a
+translation the search never proposes, and EM has to slide there during
+annealing — which it usually does not, because at large `sigma2` the pose
+update keeps re-centring the whole model on the fragment. Symptoms: the fit
+looks fine for central fragments and "stays centred" for end fragments.
+
+The fragment recipe, in order of importance:
+
+1. **Pin the scale** — `with_scale=False` if the model is already in physical
+   units, otherwise `scale_bounds=(lo, hi)` around 1. With a free scale the
+   closed-form estimate shrinks the whole model into the fragment, and the
+   search cannot tell a fragment from a small complete object.
+2. **`translation_anchor_count=4–8`.** Adds fragment-sized local centroids of
+   the model as translation seeds ("the target is the part of the model
+   around here"). Activates only when the target's RMS radius is below
+   `anchor_completeness_threshold` (0.9) of the model's, so complete targets
+   are unchanged. Coarse cost scales with the anchors actually used; use the
+   screening funnel (`coarse_screen_iterations < coarse_iterations`,
+   `coarse_survivor_count` per rotation) to keep it cheap.
+3. **Starting variance.** When seeding activates, `initial_sigma2` defaults
+   to 0.25 (normalized frame, target RMS radius = 1) instead of the classic
+   whole-model estimate. This matters more than anything else on the list:
+   on a tapered test rod the seeds alone recovered nothing (the first
+   soft M-steps re-centred the model before any seed could take hold), while
+   a fragment-scale start recovered the pose with or without adaptive mixing.
+   Override with `initial_sigma2=` if your fragment is unusually noisy
+   (larger) or the rotation lattice is dense (smaller).
+4. **`adaptive_mixing=1.0`** (optional). Lets model points with no data switch
+   off, which removes the residual centring pull and gives the fragment's
+   distinctive points their proper weight in the fit and the score. Smaller
+   `alpha` switches off faster; larger stays closer to classic CPD.
+
+Read `translation_anchors_used` to confirm seeding activated, and
+`winner_support` / `distinct_hypotheses` to see how many refined starts
+agreed on the winner versus how many different fits survived. These summarize
+the explored solutions; they do not certify that the correct pose was searched.
+
+### Continuing between stages
+
+The pose funnel resumes screened survivors for the remaining coarse budget,
+then transfers their variance and mixture into refinement. The
+`initial_sigma2` option applies only to the first coarse pass. The fitted models
+are clustered using `merge_tolerance` before both pruning steps, so duplicate
+starts do not fill the refinement budget. `refine_count` is a maximum; fewer
+fits run if fewer distinct solutions survive. Set `merge_tolerance=0` to disable
+clustering. The identity basin is retained when the budget has room for more
+than one fit, even if a different start represents that basin.
+
+For the final atlas registration, use `initial_state=init.state` (or
+`initial_state=fit.state` when resuming an atlas fit). In Rust, use
+`AtlasConfig { initial_state: Some(init.state()), ..config }`. The state carries
+pose, shape, variance in original target units, mixture weights, and background
+density. Variance and outlier odds are converted automatically when normalization
+or target sample count changes. New shape modes start at zero. Mean coordinates
+are retained with the weights, allowing transfer to a reordered or denser
+sampling without assuming that equal point counts mean equal vertex order.
+
+Keep `with_scale`, `scale_bounds`, `adaptive_mixing`, `outlier_weight`,
+`lambda_regularization`, and any landmark constraints consistent across calls.
+These settings belong to the receiving config, not to the state. Without
+`adaptive_mixing`, a saved nonuniform mixture stays active with fixed weights.
+An explicit `sigma2` overrides the saved variance in the receiving **working**
+frame; individual pose initializers and `initial_state` are mutually exclusive.
+
+Mixture transfer interpolates relative occupancies by nearest mean vertex and
+renormalizes on the destination. It assumes comparable sampling density and is
+not a surface-area correction. Coarse/refinement maps are built once and shared
+across hypotheses.
+
 ## Shape completion & uncertainty (partial objects)
 
 When you register an atlas to a *partial* observation and want the missing
 region filled in with a confidence estimate, build a posterior from the fit
 (`AtlasResult.posterior` / `.posterior`; Rust needs the `completion`
 feature). Notes on the knobs:
+
+- **Observation model** — completion conditions on the fitted `sigma2` and
+  mixing weights; it does not run a new variance annealing loop. The fitted
+  outlier density is preserved in original target units. `outlier_weight=None`
+  inherits the registration's outlier weight, and an explicit value overrides
+  it (`0.0` requests clean assignments). Rust uses `Option<f64>` for this
+  override. Adaptive weights also transfer to a denser completion mean using
+  the same occupancy interpolation as registration continuation.
 
 - **`completeness`** — roughly what fraction of the object was observed, in
   `(0, 1]`. Visibility is inferred from the fitted correspondence: the
@@ -160,11 +241,12 @@ feature). Notes on the knobs:
   scalar — and it separates "genuinely unobserved" from "observed but
   poorly fit" better than a fixed threshold. Omit it to fall back to a
   weight floor (`visibility_floor`).
-- **`prior_temperature`** — the atlas `lambda_regularization` is a prior
-  *temperature*; completion uses the statistically correct prior
+- **`prior_temperature`** — this legacy name denotes a prior **precision
+  multiplier**, matching atlas `lambda_regularization`; completion uses the original prior
   (`temperature = 1`) by default. Set it equal to the `lambda_regularization`
-  you fit with if you need the completion's point estimate to reproduce the
-  fitted coefficients exactly.
+  you fit with to retain the same shape-prior strength. Exact coefficient
+  agreement additionally requires a converged fit and the same conditioning
+  information; visibility truncation or omitted landmark terms can change it.
 - **Confidence is coefficient-space, not per-point-independent.** A rank-`k`
   model has only `k` degrees of freedom, so once the fragment pins the
   coefficients, *all* points — observed and missing — are similarly
